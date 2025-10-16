@@ -1,448 +1,384 @@
-# ms_leaderboard_bot.py
-# DP World Tour – Marcel Schneider: "Playing this week" + Live-Leaderboard
-# - 1x täglich: Spieler-Seite scannen -> nächstes/aktuelles Turnier + 2-Tage-Reminder
-# - während Event: alle 30 Min Leaderboard prüfen:
-#     * Zwischenpost: sobald Marcel eine Runde fertig hat
-#     * Round-Final: sobald ALLE die Runde fertig haben
-# - State wird in derselben Issue wie beim ersten Bot abgelegt (eigene Keys)
-#
-# ENV:
-#   DISCORD_WEBHOOK_LIVE   -> zweiter Discord Webhook (für diesen Bot)
-#   GITHUB_TOKEN, GH_REPO, STATE_ISSUE_NUMBER -> wie beim ersten Bot
-#   RELAY_BASE (optional)  -> z.B. https://dein-worker.workers.dev  (der Worker nimmt ?url=...)
-#
-#   PLAYER_ID=35703 (default)
-#   PLAYER_PAGE=https://www.europeantour.com/players/marcel-schneider-35703/?tour=dpworld-tour
-#   RESULTS_URL=https://www.europeantour.com/api/v1/players/35703/results/2025/
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 
-import os, re, json, time, random, base64, sys, subprocess
-from datetime import datetime, timedelta, timezone
-from urllib.parse import quote_plus
+"""
+DPWT Leaderboard Watcher – robuste Event-Erkennung + Debug-Logging
+
+Was macht das Skript?
+- Lädt die Profilseite des Spielers (Overview).
+- Extrahiert das aktuelle Event (Link + EventId) robust:
+  1) JSON aus <live-event-banner :events="[...]">
+  2) Fallback: Link in der "Playing this week"-Tabelle (a.event_tournament-link)
+- Schreibt immer Log-File + HTML-Snapshot.
+- Meldet per Discord:
+  - 2 Tage vor Turnierstart (zweiter Webhook).
+  - Optional: „Aktives Event erkannt“ (erster Webhook), damit man die Erkennung sieht.
+
+Hinweis:
+- Reines HTML-Scraping – kein JS nötig.
+- Zeitzonen sauber: StartDate ist UTC (ISO-8601); Vergleich in UTC.
+
+ENV-Variablen (siehe Workflow unten):
+- PLAYER_SLUG (z.B. "marcel-schneider-35703")
+- TOUR_SLUG (z.B. "dpworld-tour")
+- DISCORD_WEBHOOK_ANNOUNCE  (dein „normaler“ Kanal)
+- DISCORD_WEBHOOK_SECOND    (zweiter Hook für Vorankündigungen)
+- USER_AGENT (optional, sonst Browser-ähnlich)
+"""
+
+import os
+import re
+import json
+import time
+import pathlib
+import logging
+from logging.handlers import RotatingFileHandler
+from datetime import datetime, timezone, timedelta
+from urllib.parse import urljoin
 
 import requests
+from bs4 import BeautifulSoup
+from requests.adapters import HTTPAdapter, Retry
 
-PLAYER_ID = int(os.getenv("PLAYER_ID", "35703"))
-PLAYER_PAGE = os.getenv(
-    "PLAYER_PAGE",
-    "https://www.europeantour.com/players/marcel-schneider-35703/?tour=dpworld-tour"
+
+# ---------------------------
+# Konfiguration / Pfade
+# ---------------------------
+
+RUN_ID = time.strftime("%Y%m%d-%H%M%S")
+BASE_URL = "https://www.europeantour.com"
+
+ROOT = pathlib.Path(__file__).resolve().parent
+LOG_DIR = ROOT / "logs"
+SNAP_DIR = ROOT / "snapshots"
+STATE_DIR = ROOT / "state"     # (optional) für spätere Deduplizierung
+REPORT_DIR = ROOT / "reports"
+
+for d in (LOG_DIR, SNAP_DIR, STATE_DIR, REPORT_DIR):
+    d.mkdir(exist_ok=True)
+
+LOG_PATH = LOG_DIR / f"dpwt_watcher_{RUN_ID}.log"
+REPORT_PATH = REPORT_DIR / "last_run.txt"
+
+
+# ---------------------------
+# Logging
+# ---------------------------
+
+handler = RotatingFileHandler(LOG_PATH, maxBytes=1_000_000, backupCount=5)
+logging.basicConfig(
+    level=logging.DEBUG,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[handler]
 )
-RESULTS_URL = os.getenv(
-    "RESULTS_URL",
-    "https://www.europeantour.com/api/v1/players/35703/results/2025/"
-)
-DISCORD_WEBHOOK = os.getenv("DISCORD_WEBHOOK_LIVE")  # <- eigener Webhook
+log = logging.getLogger("dpwt-watcher")
 
-# GitHub State (wir verwenden die gleiche Issue wie der erste Bot, aber eigene Keys)
-GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
-GH_REPO = os.getenv("GH_REPO")
-env_val = os.getenv("STATE_ISSUE_NUMBER", "").strip()
-STATE_ISSUE_NUMBER = int(env_val) if env_val.isdigit() else 0
 
-RELAY_BASE = os.getenv("RELAY_BASE", "").rstrip("/")
+# ---------------------------
+# HTTP Session (anti-block)
+# ---------------------------
 
-# ---- HTTP Basics -------------------------------------------------------------
-
-USER_AGENTS = [
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 13_6) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Safari/605.1.15",
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126 Safari/537.36",
-]
-
-session = requests.Session()
-session.timeout = 30
-
-def _headers():
-    return {
-        "User-Agent": random.choice(USER_AGENTS),
-        "Accept": "text/html,application/json;q=0.9,*/*;q=0.8",
-        "Accept-Language": "de-DE,de;q=0.9,en;q=0.8",
-        "Referer": "https://www.europeantour.com/",
-        "Origin": "https://www.europeantour.com",
+def make_session() -> requests.Session:
+    ua = os.getenv("USER_AGENT") or (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36"
+    )
+    s = requests.Session()
+    s.headers.update({
+        "User-Agent": ua,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "de-DE,de;q=0.9,en-US;q=0.8,en;q=0.7",
         "Cache-Control": "no-cache",
         "Pragma": "no-cache",
+        "Referer": BASE_URL + "/dpworld-tour/",
         "Connection": "keep-alive",
+        # Ganz simpel: ein Cookie-Key, damit wir nicht „leer“ kommen
+        "Cookie": "et_platform=europeantour-web",
+    })
+    retries = Retry(
+        total=5, backoff_factor=0.6,
+        status_forcelist=(429, 500, 502, 503, 504),
+        allowed_methods=frozenset(["GET", "HEAD"])
+    )
+    adapter = HTTPAdapter(max_retries=retries, pool_connections=20, pool_maxsize=20)
+    s.mount("https://", adapter)
+    s.mount("http://", adapter)
+    return s
+
+
+# ---------------------------
+# Hilfen
+# ---------------------------
+
+def utcnow() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def save_snapshot(html: str, name: str):
+    path = SNAP_DIR / f"{RUN_ID}_{name}.html"
+    path.write_text(html, encoding="utf-8")
+    log.info("HTML snapshot: %s", path)
+    return path
+
+
+def post_discord(webhook: str | None, content: str, embed: dict | None = None) -> bool:
+    if not webhook:
+        log.warning("Kein Webhook gesetzt – skip.")
+        return False
+    payload = {"content": content}
+    if embed:
+        payload["embeds"] = [embed]
+    try:
+        r = requests.post(webhook, json=payload, timeout=20)
+        ok = 200 <= r.status_code < 300
+        log.info("Discord POST %s → %s", webhook[:60] + "...", r.status_code)
+        if not ok:
+            log.warning("Discord response: %s", r.text[:300])
+        return ok
+    except Exception as e:
+        log.exception("Discord-Fehler: %s", e)
+        return False
+
+
+# ---------------------------
+# Event-Erkennung
+# ---------------------------
+
+def extract_event_from_live_banner(soup: BeautifulSoup) -> dict | None:
+    """
+    <live-event-banner :events="[...]"> enthält JSON mit EventId, EventUrl, StartDate, RoundStatus u.a.
+    """
+    leb = soup.find("live-event-banner")
+    if not leb or not leb.has_attr(":events"):
+        return None
+    try:
+        arr = json.loads(leb[":events"])
+        if not arr:
+            return None
+        evt = arr[0]
+        # AbsUrl ergänzen
+        if "EventUrl" in evt and evt["EventUrl"]:
+            evt["EventAbsUrl"] = urljoin(BASE_URL, evt["EventUrl"])
+        return evt
+    except Exception as e:
+        log.exception("Parsing live-event-banner failed: %s", e)
+        return None
+
+
+def extract_event_from_table(soup: BeautifulSoup) -> dict | None:
+    """
+    Fallback: Link aus Tabelle („Playing this week“) – <a class="event_tournament-link" href="...">
+    """
+    a = soup.select_one('a[class*="event_tournament-link"]')
+    if not a or not a.get("href"):
+        return None
+    href = a["href"].strip()
+    return {
+        "EventUrl": href,
+        "EventAbsUrl": urljoin(BASE_URL, href)
     }
 
-def _relay(url: str) -> str:
-    if RELAY_BASE:
-        return f"{RELAY_BASE}?url={quote_plus(url)}"
-    return url
 
-def get_text(url: str) -> str:
-    last = None
-    for _ in range(4):
-        try:
-            r = session.get(_relay(url), headers=_headers(), timeout=30)
-            if r.status_code in (403, 429, 503):
-                raise requests.HTTPError(f"http {r.status_code}")
-            r.raise_for_status()
-            return r.text
-        except Exception as e:
-            last = e
-            time.sleep(1.5 + random.random())
-    raise last
-
-def get_json(url: str):
-    last = None
-    for _ in range(4):
-        try:
-            r = session.get(_relay(url), headers=_headers(), timeout=30)
-            if r.status_code in (403, 429, 503):
-                raise requests.HTTPError(f"http {r.status_code}")
-            r.raise_for_status()
-            return r.json()
-        except Exception as e:
-            last = e
-            time.sleep(1.5 + random.random())
-    raise last
-
-def ensure_bs4():
+def parse_iso_utc(s: str | None) -> datetime | None:
+    if not s:
+        return None
     try:
-        import bs4  # noqa
-        return
-    except Exception:
-        subprocess.check_call([sys.executable, "-m", "pip", "install", "beautifulsoup4==4.12.3"])
-
-def ensure_playwright():
-    try:
-        import playwright  # noqa
-        return
-    except Exception:
-        # fallback nur wenn wirklich nötig
-        subprocess.check_call([sys.executable, "-m", "pip", "install", "playwright==1.55.0"])
-        subprocess.check_call([sys.executable, "-m", "playwright", "install", "chromium"])
-
-def fetch_html(url: str) -> str:
-    try:
-        return get_text(url)
-    except Exception:
-        # sehr selten nötig
-        ensure_playwright()
-        from playwright.sync_api import sync_playwright
-        with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True)
-            ctx = browser.new_context(user_agent=random.choice(USER_AGENTS), locale="de-DE")
-            page = ctx.new_page()
-            page.goto(url, wait_until="load", timeout=45000)
-            html = page.content()
-            browser.close()
-        return html
-
-# ---- Helpers ----------------------------------------------------------------
-
-def iso_dt(s):
-    if not s: return None
-    return datetime.fromisoformat(s.replace("Z", "+00:00"))
-
-def eur_date_to_iso(dmy: str):
-    # "15/10/2025" -> date
-    try:
-        return datetime.strptime(dmy.strip(), "%d/%m/%Y").date()
+        # Die Seite liefert z.B. "2025-10-15T18:30:00+00:00"
+        dt = datetime.fromisoformat(s)
+        return dt.astimezone(timezone.utc)
     except Exception:
         return None
 
-def send_discord(msg: str):
-    if not DISCORD_WEBHOOK:
-        print("[DRY] ", msg)
-        return
-    r = session.post(DISCORD_WEBHOOK, json={"content": msg}, timeout=20)
-    r.raise_for_status()
 
-# ---- State in Issue ----------------------------------------------------------
-
-def issue_state_enabled():
-    return bool(GITHUB_TOKEN and GH_REPO and STATE_ISSUE_NUMBER > 0)
-
-def gh_issue_get_state():
-    if not issue_state_enabled():
-        return {}
-    h = {"Authorization": f"token {GITHUB_TOKEN}"}
-    url = f"https://api.github.com/repos/{GH_REPO}/issues/{STATE_ISSUE_NUMBER}"
-    r = session.get(url, headers=h, timeout=20)
-    if r.status_code == 404:
-        return {}
-    r.raise_for_status()
-    body = r.json().get("body") or ""
-    a, b = "<!--STATE_JSON_START-->", "<!--STATE_JSON_END-->"
-    if a in body and b in body:
-        blob = body.split(a)[1].split(b)[0].strip()
-        try:
-            return json.loads(blob)
-        except Exception:
-            return {}
-    return {}
-
-def gh_issue_set_state(state, title="DPWT State"):
-    if not issue_state_enabled():
-        return
-    h = {"Authorization": f"token {GITHUB_TOKEN}"}
-    get_url = f"https://api.github.com/repos/{GH_REPO}/issues/{STATE_ISSUE_NUMBER}"
-    r = session.get(get_url, headers=h, timeout=20)
-    if r.status_code == 404:
-        post_url = f"https://api.github.com/repos/{GH_REPO}/issues"
-        body = f"{title}\n\n<!--STATE_JSON_START-->\n{json.dumps(state, ensure_ascii=False, indent=2)}\n<!--STATE_JSON_END-->"
-        r2 = session.post(post_url, headers=h, json={"title": title, "body": body}, timeout=20)
-        r2.raise_for_status()
-        return
-    r.raise_for_status()
-    issue = r.json()
-    body_old = issue.get("body") or ""
-    a, b = "<!--STATE_JSON_START-->", "<!--STATE_JSON_END-->"
-    payload = json.dumps(state, ensure_ascii=False, indent=2)
-    if a in body_old and b in body_old:
-        new_body = body_old.split(a)[0] + a + "\n" + payload + "\n" + b + body_old.split(b)[1]
-    else:
-        new_body = f"{body_old}\n\n{a}\n{payload}\n{b}"
-    patch_url = f"https://api.github.com/repos/{GH_REPO}/issues/{STATE_ISSUE_NUMBER}"
-    r3 = session.patch(patch_url, headers=h, json={"body": new_body}, timeout=20)
-    r3.raise_for_status()
-
-def state_load():
-    st = gh_issue_get_state() if issue_state_enabled() else {}
-    st.setdefault("leaderboard_bot", {
-        "pre_alert_event_id": None,
-        "active_event_url": None,
-        "active_event_id": None,
-        "round_done": {},        # {event_id: {round_no: True}}
-        "round_final": {},       # {event_id: {round_no: True}}
-        "round_cum_to_par": {},  # {event_id: {round_no: value}}
-    })
-    return st
-
-def state_save(st):
-    gh_issue_set_state(st)
-
-# ---- Parsing "Playing this week" --------------------------------------------
-
-def parse_playing_this_week(html: str):
+def is_event_live_or_imminent(evt: dict) -> tuple[bool, str]:
     """
-    Liefert (start_date: date, event_name, event_url_abs) oder None.
-    Robust: sucht Anker '/dpworld-tour/.../' in Nähe von 'Playing this week'.
+    Robust:
+    - live: RoundStatus in {"1","2"} (1=live, 2=suspended)
+    - ansonsten Zeitfenster (Start/Ende) als Fallback.
     """
-    ensure_bs4()
-    from bs4 import BeautifulSoup
+    rs = str(evt.get("RoundStatus", ""))
+    if rs in {"1", "2"}:
+        return True, f"RoundStatus={rs}"
+
+    start = parse_iso_utc(evt.get("StartDate"))
+    end = parse_iso_utc(evt.get("EndDate"))
+    now = utcnow()
+
+    if start and start - now <= timedelta(days=0) and (not end or now <= end):
+        return True, "within start/end window"
+    return False, "not live by status/time"
+
+
+def days_to_start(evt: dict) -> int | None:
+    start = parse_iso_utc(evt.get("StartDate"))
+    if not start:
+        return None
+    delta = (start - utcnow()).days
+    # bei z.B. 1.8 Tagen wollen wir „1“ – runde ab
+    return int((start - utcnow()).total_seconds() // 86400)
+
+
+def extract_event(html: str) -> dict | None:
     soup = BeautifulSoup(html, "html.parser")
 
-    # Heuristik: Section mit Titel "Playing this week"
-    header = None
-    for h in soup.find_all(["h2","h3","div","span"]):
-        if h.get_text(strip=True).lower() == "playing this week":
-            header = h
-            break
-    root = header.parent if header else soup
+    evt = extract_event_from_live_banner(soup)
+    if evt:
+        log.info("Live-banner Event gefunden: %s", {k: evt.get(k) for k in ("EventId","EventUrl","RoundStatus","StartDate")})
+        return evt
 
-    # Finde ersten Link auf ein DP-World-Tour Event
-    a = None
-    for link in root.find_all("a", href=True):
-        if link["href"].startswith("/dpworld-tour/") and link["href"].count("/") >= 3:
-            a = link
-            break
-    if not a:
-        return None
+    evt = extract_event_from_table(soup)
+    if evt:
+        log.info("Tabellen-Event-Link gefunden: %s", evt["EventUrl"])
+        return evt
 
-    # Datum steht in Nachbarzellen mit class 'table__cell-inner' – nimm die erste dd/mm/yyyy
-    date_text = None
-    cells = a.find_parent()
-    if cells:
-        txt = cells.get_text(" ", strip=True)
-        m = re.search(r"\b(\d{2}/\d{2}/\d{4})\b", txt)
-        if m:
-            date_text = m.group(1)
-
-    start_date = eur_date_to_iso(date_text) if date_text else None
-    event_url_abs = "https://www.europeantour.com" + a["href"]
-    event_name = a.get_text(strip=True)
-    return start_date, event_name, event_url_abs
-
-# ---- EventId via Results-API mappen -----------------------------------------
-
-def map_event_id_from_results(event_url_path: str):
-    """
-    Nimmt '/dpworld-tour/xxx-2025/' und sucht in der Results-API nach EventId.
-    """
-    data = get_json(RESULTS_URL)
-    for e in data.get("Results", []):
-        if e.get("EventUrl") == event_url_path:
-            return e.get("EventId"), data.get("Season")
-    return None, data.get("Season")
-
-# ---- Leaderboard JSON -------------------------------------------------------
-
-def fetch_leaderboard(event_id: int):
-    url = f"https://www.europeantour.com/api/sportdata/Leaderboard/Strokeplay/{event_id}/type/load"
-    return get_json(url)
-
-def find_player(players, player_id):
-    for p in players or []:
-        if int(p.get("PlayerId", 0)) == player_id:
-            return p
+    log.info("Kein Event im HTML gefunden (weder banner noch Tabelle).")
     return None
 
-def round_strokes_map(p):
-    d = {}
-    for r in (p.get("Rounds") or []):
-        d[int(r.get("RoundNo"))] = r.get("Strokes")
-    return d
 
-def everyone_finished_round(players, rnd: int) -> bool:
-    for p in players or []:
-        m = round_strokes_map(p)
-        if m.get(rnd) is None:
-            return False
-    return True
+# ---------------------------
+# Leaderboard-Hilfen (optional / vorbereitet)
+# ---------------------------
 
-# ---- Messaging --------------------------------------------------------------
-
-def fmt_eur(num):
-    # Tausenderpunkte / Komma – hier nur für Scores nicht nötig, behalten für evtl. Erweiterung
+def fetch_leaderboard_json(session: requests.Session, event_id: int) -> dict | None:
+    """
+    Strokeplay ist bei DPWT Standard. Der 'type/load'-Endpoint liefert alles Wichtige.
+    """
+    url = f"{BASE_URL}/api/sportdata/Leaderboard/Strokeplay/{event_id}/type/load"
+    log.info("GET %s", url)
+    r = session.get(url, timeout=30)
+    if r.status_code != 200:
+        log.warning("LB %s → %s", url, r.status_code)
+        return None
     try:
-        s = f"{num:,.2f}"
-        return s.replace(",", "X").replace(".", ",").replace("X", ".")
+        return r.json()
     except Exception:
-        return str(num)
+        log.exception("JSON parse failed for leaderboard")
+        return None
 
-def post_pre_alert(event_name, start_date, event_url):
-    ds = start_date.strftime("%d.%m.%Y") if start_date else "bald"
-    msg = (
-        f"**{event_name}** startet in 2 Tagen.\n"
-        f"Startdatum: {ds}\n"
-        f"Leaderboard: {event_url}leaderboard"
-    )
-    send_discord(msg)
 
-def post_round_done(event_name, event_url, rnd, strokes, delta_rnd, cum_to_par, pos):
-    delta_txt = f"{delta_rnd:+d}" if isinstance(delta_rnd, int) else str(delta_rnd)
-    cum_txt = f"{cum_to_par:+d}" if isinstance(cum_to_par, int) else str(cum_to_par)
-    msg = (
-        f"**{event_name}** – **Runde {rnd}** beendet (Marcel):\n"
-        f"Strokes R{rnd}: **{strokes}** (ΔRunde: {delta_txt})\n"
-        f"Kumuliert To-Par: **{cum_txt}**\n"
-        f"Tagesplatzierung: **{pos}**\n"
-        f"Link: {event_url}leaderboard"
-    )
-    send_discord(msg)
+def find_player_round_done(lb_json: dict, player_id: int, round_no: int) -> tuple[bool, int | None, int | None, int | None]:
+    """
+    Prüft, ob ein Spieler (player_id) die Runde round_no beendet hat.
+    Rückgabe: (is_done, strokes_of_round, course_par_for_round, position)
+    """
+    if not lb_json or "Players" not in lb_json:
+        return (False, None, None, None)
 
-def post_round_final(event_name, event_url, rnd, pos, cum_to_par):
-    cum_txt = f"{cum_to_par:+d}" if isinstance(cum_to_par, int) else str(cum_to_par)
-    msg = (
-        f"**{event_name}** – **Runde {rnd}** komplett (alle Spieler durch):\n"
-        f"Marcel nach R{rnd}: Platz **{pos}**, kumuliert **{cum_txt}**\n"
-        f"Link: {event_url}leaderboard"
-    )
-    send_discord(msg)
+    for p in lb_json["Players"]:
+        if int(p.get("PlayerId", -1)) != int(player_id):
+            continue
+        # Runden-Array (siehe Screenshots: Rounds: [{RoundNo:1, Strokes:64, ...}, ...])
+        rounds = p.get("Rounds") or []
+        pos = p.get("Position") or None
+        for r in rounds:
+            if int(r.get("RoundNo", -1)) == int(round_no):
+                strokes = r.get("Strokes")
+                course_no = r.get("CourseNo")  # Par kann man ggf. über HoleAverages/Scorecard ziehen
+                is_done = strokes is not None
+                return (bool(is_done), int(strokes) if strokes is not None else None, None if course_no is None else int(course_no), int(pos) if pos else None)
+        # Falls keine Runde mit round_no existiert → nicht fertig
+        return (False, None, None, int(pos) if pos else None)
 
-# ---- Orchestrierung ---------------------------------------------------------
+    return (False, None, None, None)
+
+
+# ---------------------------
+# Main
+# ---------------------------
 
 def main():
-    st = state_load()
-    L = st["leaderboard_bot"]
+    # ENV
+    player_slug = os.getenv("PLAYER_SLUG", "marcel-schneider-35703").strip("/")
+    tour_slug = os.getenv("TOUR_SLUG", "dpworld-tour").strip("/")
 
-    # 1) Spieler-Seite scannen (für Reminder + Event-URL)
-    html = fetch_html(PLAYER_PAGE)
-    got = parse_playing_this_week(html)
-    start_date, event_name, event_url = (None, None, None)
-    if got:
-        start_date, event_name, event_url = got
-    else:
-        print("Playing-this-week nicht gefunden – fahre fort (ggf. nur Live-Teil).")
+    discord_announce = os.getenv("DISCORD_WEBHOOK_ANNOUNCE", "").strip()
+    discord_second = os.getenv("DISCORD_WEBHOOK_SECOND", "").strip()
 
-    # 2) 2-Tage-Reminder
-    if start_date and event_name and event_url:
-        if (start_date - datetime.utcnow().date()).days == 2:
-            # EventId für deduplizieren bestimmen
-            path = event_url.replace("https://www.europeantour.com", "")
-            eid, _season = map_event_id_from_results(path)
-            key = str(eid) if eid else event_url
-            if L.get("pre_alert_event_id") != key:
-                post_pre_alert(event_name, start_date, event_url)
-                L["pre_alert_event_id"] = key
+    session = make_session()
 
-        # Merke aktive Event-URL (für Live)
-        L["active_event_url"] = event_url
+    player_url = f"{BASE_URL}/players/{player_slug}/?tour={tour_slug}"
+    log.info("Lese Profilseite: %s", player_url)
 
-    # 3) Live-Leaderboard nur, wenn Event-Fenster ungefähr passt (EndDate-3d..EndDate+12h)
-    #    Wir holen EventId aus der Results-API (zuverlässig).
-    active_url = L.get("active_event_url")
-    if not active_url:
-        state_save(st)
+    try:
+        resp = session.get(player_url, timeout=40)
+        resp.raise_for_status()
+    except Exception as e:
+        log.exception("Fehler beim Laden der Profilseite: %s", e)
+        REPORT_PATH.write_text(f"❌ Fehler beim Laden: {e}\nURL: {player_url}\n", encoding="utf-8")
+        return
+
+    save_snapshot(resp.text, "player_overview")
+
+    # Event aus HTML ziehen
+    evt = extract_event(resp.text)
+    if not evt:
+        msg = "Kein aktives Event erkannt – (weder live-banner noch Tabellenlink gefunden)."
+        log.warning(msg)
+        REPORT_PATH.write_text("Kein aktives Event gefunden.\n", encoding="utf-8")
         print("Kein aktives Event bekannt – Ende.")
         return
 
-    event_path = active_url.replace("https://www.europeantour.com", "")
-    event_id, season = map_event_id_from_results(event_path)
-    if not event_id:
-        print("EventId nicht via Results-API gefunden – Ende (noch nicht im Katalog?).")
-        state_save(st)
-        return
+    # Felder normalisieren:
+    evt_url = evt.get("EventAbsUrl") or urljoin(BASE_URL, evt.get("EventUrl", "/"))
+    evt_id = evt.get("EventId")
+    round_status = str(evt.get("RoundStatus", ""))
+    round_no = evt.get("RoundNo")
 
-    L["active_event_id"] = event_id
+    # Start/Countdown
+    dts = days_to_start(evt)
+    if dts is not None:
+        log.info("Days until start (UTC): %s", dts)
 
-    # Rough activity check über EndDate-3 Tage
-    res_all = get_json(RESULTS_URL)
-    end_dt = None
-    for e in res_all.get("Results", []):
-        if e.get("EventId") == event_id:
-            end_dt = iso_dt(e.get("EndDate"))
-            break
-    now = datetime.now(timezone.utc)
-    active_window = False
-    if end_dt:
-        active_window = (end_dt - timedelta(days=3) <= now <= end_dt + timedelta(hours=12))
+    # --- 2 Tage vorher Info an zweiten Hook
+    if dts == 2:
+        text = f"⏳ In **2 Tagen** beginnt das Turnier: {evt.get('Name','(unbekannt)')} – {evt_url}"
+        post_discord(discord_second, text)
 
-    if not active_window:
-        state_save(st)
-        print("Event nicht im aktiven Fenster – Ende.")
-        return
+    # Live/im Fenster?
+    live, reason = is_event_live_or_imminent(evt)
+    log.info("Event live/imminent? %s (%s)", live, reason)
 
-    # 4) Leaderboard ziehen
-    lb = fetch_leaderboard(event_id)
-    players = lb.get("Players") or []
-    me = find_player(players, PLAYER_ID)
-    if not me:
-        print("Marcel im Leaderboard nicht gefunden – Ende.")
-        state_save(st)
-        return
+    # Optional: Info in Hauptkanal, damit sichtbar ist, dass Erkennung klappt
+    embed = {
+        "title": evt.get("Name", "Unbekanntes Event"),
+        "url": evt_url,
+        "fields": [
+            {"name": "EventId", "value": str(evt_id), "inline": True},
+            {"name": "RoundNo", "value": str(round_no), "inline": True},
+            {"name": "RoundStatus", "value": str(round_status), "inline": True},
+            {"name": "Start (UTC)", "value": str(evt.get("StartDate")), "inline": False},
+        ],
+        "timestamp": utcnow().isoformat()
+    }
+    post_discord(discord_announce, f"🔎 Event erkannt ({'LIVE' if live else 'n. live'}): {evt_url}", embed)
 
-    # Position / kumulierter To-Par
-    pos = me.get("PositionDesc") or str(me.get("Position"))
-    cum_to_par = me.get("ScoreToPar")
-    rmap = round_strokes_map(me)
+    # Report schreiben
+    REPORT_PATH.write_text(
+        json.dumps({
+            "when": utcnow().isoformat(),
+            "player_url": player_url,
+            "event": {
+                "name": evt.get("Name"),
+                "event_id": evt_id,
+                "event_url": evt_url,
+                "round_no": round_no,
+                "round_status": round_status,
+                "start_utc": evt.get("StartDate"),
+                "detected_via": "live-event-banner" if ":events" in (BeautifulSoup(resp.text, "html.parser").find("live-event-banner") or {}).attrs else "table-link"
+            },
+            "live_or_imminent": {"live": live, "reason": reason},
+            "days_to_start": dts
+        }, ensure_ascii=False, indent=2),
+        encoding="utf-8"
+    )
 
-    # State-Strukturen
-    L["round_done"].setdefault(str(event_id), {})
-    L["round_final"].setdefault(str(event_id), {})
-    L["round_cum_to_par"].setdefault(str(event_id), {})
+    print("Run OK – Details siehe logs/ & reports/.")
 
-    # Welche Runde ist "neu fertig"?
-    for rnd in (1,2,3,4):
-        strokes = rmap.get(rnd)
-        if strokes is None:
-            continue
-        if not L["round_done"][str(event_id)].get(str(rnd)):
-            # ΔRunde berechnen: cum_to_par(Rn) - cum_to_par(Rn-1)
-            # Wir kennen kumulierten Wert JETZT; den vorherigen aus State ziehen
-            prev_cum = L["round_cum_to_par"][str(event_id)].get(str(rnd-1))
-            delta_rnd = cum_to_par - prev_cum if (prev_cum is not None and cum_to_par is not None) else None
-            post_round_done(event_name, active_url, rnd, strokes, delta_rnd, cum_to_par, pos)
-            L["round_done"][str(event_id)][str(rnd)] = True
-            L["round_cum_to_par"][str(event_id)][str(rnd)] = cum_to_par
-
-    # Round-Final (alle fertig)?
-    for rnd in (1,2,3,4):
-        if not L["round_done"][str(event_id)].get(str(rnd)):
-            # Marcel hat die Runde noch nicht fertig -> Round-Final für Rn sowieso nicht
-            continue
-        if L["round_final"][str(event_id)].get(str(rnd)):
-            continue
-        if everyone_finished_round(players, rnd):
-            post_round_final(event_name, active_url, rnd, pos, cum_to_par)
-            L["round_final"][str(event_id)][str(rnd)] = True
-
-    state_save(st)
 
 if __name__ == "__main__":
     try:
         main()
     except Exception as e:
-        print("FEHLER:", e)
-        # kein Re-Raise, damit der Workflow nicht rot wird, wenn mal ein 403/Timeout kommt
+        log.exception("Unbehandelter Fehler: %s", e)
+        REPORT_PATH.write_text(f"❌ Unbehandelter Fehler: {e}\n", encoding="utf-8")
+        raise
