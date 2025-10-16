@@ -58,25 +58,20 @@ def ensure_playwright():
     if _PW_READY:
         return
     try:
-        # probier vorhandene Installation
         from playwright.sync_api import sync_playwright  # noqa: F401
     except Exception:
-        # versuche nacheinander bekannte Versionen, dann latest
         for pkg in ("playwright==1.55.0", "playwright==1.54.0", "playwright"):
             try:
                 subprocess.check_call([sys.executable, "-m", "pip", "install", pkg])
                 break
             except Exception:
                 continue
-    # Browser installieren (Chromium)
     try:
         subprocess.check_call([sys.executable, "-m", "playwright", "install", "chromium", "--with-deps"])
-        # prüfe Import
         from playwright.sync_api import sync_playwright  # noqa: F401
         _PW_READY = True
     except Exception as e:
         _PW_READY = False
-        # Kein harter Abbruch: Fallback bleibt deaktiviert, requests wird genutzt.
         print(f"Playwright-Setup nicht verfügbar: {e}")
 
 def fetch_json_playwright(url):
@@ -129,11 +124,14 @@ def de_decimal(n):
         return str(n)
 
 # ---------- Domain-Logik ----------
-def rounds_map(rounds):
-    d = {}
+def rounds_maps(rounds):
+    """Liefert zwei Maps: strokes[round] und par[round]."""
+    strokes, pars = {}, {}
     for it in rounds or []:
-        d[it.get("RoundNo")] = it.get("Strokes")
-    return d
+        rn = it.get("RoundNo")
+        strokes[rn] = it.get("Strokes")
+        pars[rn] = it.get("Par")
+    return strokes, pars
 
 def event_active(e):
     # Aktiv, wenn im typischen Turnierfenster und noch nicht komplett abgeschlossen
@@ -145,8 +143,8 @@ def event_active(e):
     window = start_dt <= now <= end_dt + timedelta(hours=12)
     if not window:
         return False
-    r = rounds_map(e.get("Rounds"))
-    complete = all(r.get(i) is not None for i in [1, 2, 3, 4])
+    strokes, _ = rounds_maps(e.get("Rounds"))
+    complete = all(strokes.get(i) is not None for i in [1, 2, 3, 4])
     finished = e.get("Total") is not None and e.get("ScoreToPar") is not None and complete
     return not finished
 
@@ -168,17 +166,18 @@ def build_round_msgs(e):
     name = e.get("EventName")
     url = "https://www.europeantour.com" + e.get("EventUrl", "")
     pos = e.get("PositionDesc") or str(e.get("Position"))
-    r = rounds_map(e.get("Rounds"))
+    strokes, pars = rounds_maps(e.get("Rounds"))
     msgs = []
     for i in [1, 2, 3, 4]:
-        s = r.get(i)
+        s = strokes.get(i)
+        p = pars.get(i)
         if s is None:
             continue
         msg = (
             f"**{name}** – Zwischenstand\n"
             f"**Runde:** {i}\n"
             f"**Spieler:** Marcel Schneider\n"
-            f"**Score (R{i}):** {s}\n"
+            f"**Score:** {s} (Par: {p})\n"
             f"**Platz:** {pos}\n"
             f"**Link:** {url}"
         )
@@ -191,7 +190,7 @@ def build_final_msg(e, season):
     end_dt = iso_to_dt(e.get("EndDate"))
     ds = end_dt.strftime("%d.%m.%Y") if end_dt else ""
     pos = e.get("PositionDesc") or str(e.get("Position"))
-    r = rounds_map(e.get("Rounds"))
+    strokes, pars = rounds_maps(e.get("Rounds"))
     total = e.get("Total")
     to_par = e.get("ScoreToPar")
     pts = e.get("Points")
@@ -200,10 +199,10 @@ def build_final_msg(e, season):
         f"**Marcel Schneider** hat die **{name}** **Saison {season}** abgeschlossen.\n\n"
         f"**Enddatum:** {ds}\n"
         f"**Platz:** {pos}\n"
-        f"**R1:** {r.get(1)}\n"
-        f"**R2:** {r.get(2)}\n"
-        f"**R3:** {r.get(3)}\n"
-        f"**R4:** {r.get(4)}\n"
+        f"**R1:** {strokes.get(1)} (Par: {pars.get(1)})\n"
+        f"**R2:** {strokes.get(2)} (Par: {pars.get(2)})\n"
+        f"**R3:** {strokes.get(3)} (Par: {pars.get(3)})\n"
+        f"**R4:** {strokes.get(4)} (Par: {pars.get(4)})\n"
         f"**Gesamtschläge:** {total}\n"
         f"**To-Par:** {to_par}\n"
         f"**Punkte:** {de_decimal(pts)}\n"
@@ -368,10 +367,10 @@ def run_once_and_post():
     if active and current:
         eid = str(current.get("EventId"))
         seen = state["last_round_hash"].get(eid, {})
-        r = rounds_map(current.get("Rounds"))
+        strokes, _pars = rounds_maps(current.get("Rounds"))
         to_post_idx = []
         for i in [1,2,3,4]:
-            s = r.get(i)
+            s = strokes.get(i)
             if s is None:
                 continue
             key = f"R{i}"
