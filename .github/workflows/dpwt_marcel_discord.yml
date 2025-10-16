@@ -2,8 +2,7 @@ name: DPWT Marcel Schneider → Discord
 
 on:
   schedule:
-    # Alle 30 Minuten (Script drosselt intern auf 2h, wenn kein Live-Event läuft)
-    - cron: "*/30 * * * *"
+    - cron: "*/30 * * * *"         # Runner alle 30 Min (Script drosselt ggf. intern)
   workflow_dispatch: {}
 
 jobs:
@@ -28,8 +27,7 @@ jobs:
       - name: Run monitor
         env:
           DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
-          GITHUB_REPOSITORY: ${{ github.repository }}
-          GITHUB_ACTOR: ${{ github.actor }}
+          DEBUG: "1"
         run: |
           python dpwt_monitor_discord.py
 
