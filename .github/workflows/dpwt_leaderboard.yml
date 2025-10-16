@@ -3,22 +3,22 @@ name: DPWT Leaderboard Watcher
 on:
   workflow_dispatch:
   schedule:
-    # 1) Täglicher Scan der Profilseite (Erkennung + 2-Tage-Reminder)
-    - cron: "7 7 * * *"
-    # 2) Optional: Alle 30 Min. (wenn du später die LB-Logik aktivierst)
-    # - cron: "*/30 * * * *"
+    # 1) Einmal täglich zum Einsammeln des nächsten Turniers + Pre-Event-Ping
+    - cron: "07 5 * * *"
+    # 2) Alle 30 Minuten (während Turnieren für Round-Status)
+    - cron: "*/30 * * * *"
 
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
-
+    permissions:
+      contents: read
+      actions: write
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - name: Setup Python
+      - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
@@ -27,23 +27,21 @@ jobs:
           python -m pip install --upgrade pip
           pip install requests beautifulsoup4
 
-      - name: Run watcher
+      - name: Run bot
         env:
-          PLAYER_SLUG: "marcel-schneider-35703"
-          TOUR_SLUG: "dpworld-tour"
-          DISCORD_WEBHOOK_ANNOUNCE: ${{ secrets.DISCORD_WEBHOOK_ANNOUNCE }}
-          DISCORD_WEBHOOK_SECOND:   ${{ secrets.DISCORD_WEBHOOK_SECOND }}
-          # Optional: Eigener UA
-          # USER_AGENT: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36"
+          DPWT_PLAYER_ID: "35703"
+          DPWT_TOUR_SLUG: "dpworld-tour"
+          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+          DISCORD_WEBHOOK_2: ${{ secrets.DISCORD_WEBHOOK_2 }}
+          PROXY_URL: ${{ secrets.PROXY_URL }}
         run: |
           python ms_leaderboard_bot.py || true
 
-      - name: Upload logs & reports
+      - name: Upload logs & JSON reports (artifact)
         uses: actions/upload-artifact@v4
         with:
           name: dpwt-debug-${{ github.run_id }}
           path: |
-            logs/**
-            snapshots/**
-            reports/**
-          if-no-files-found: warn
+            reports/logs/*.log
+            reports/*.json
+            reports/snapshots/**
