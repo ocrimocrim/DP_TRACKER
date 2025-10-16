@@ -1,5 +1,0 @@
-{
-  "ts": "2025-10-16T14:01:25Z",
-  "step": "fetch",
-  "error": "RuntimeError('results fetch produced no JSON (see data/_debug_last_response.html)')"
-}
