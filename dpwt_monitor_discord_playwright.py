@@ -1,332 +1,402 @@
-import os, json, hashlib, datetime as dt
-from typing import Any, List, Tuple
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+import os, json, time, sys, re, pathlib, datetime
+from typing import Dict, Any, List, Tuple
 import requests
-from playwright.sync_api import sync_playwright, APIResponse, TimeoutError as PWTimeout, Page
 
-DEBUG = os.environ.get("DEBUG") == "1"
-WEBHOOK = os.environ.get("DISCORD_WEBHOOK")
+from playwright.sync_api import sync_playwright, TimeoutError as PWTimeoutError
 
-BASE = "https://www.europeantour.com"
-PLAYER_ID = 35703   # Marcel Schneider
-TOUR_ID = 1         # DP World Tour
+# -------- Konfiguration (ENV mit Fallbacks) --------
+PLAYER_ID = os.getenv("DPWT_PLAYER_ID", "35703")  # Marcel Schneider
+TOUR_ID   = os.getenv("DPWT_TOUR_ID", "1")       # DP World Tour
+SEASON    = os.getenv("DPWT_SEASON")             # leer => aktuelles Jahr
+BASE_URL  = "https://www.europeantour.com"
+WEBHOOK   = os.getenv("DISCORD_WEBHOOK_URL", "").strip()
 
-DATA_DIR = "data"
-STATE_DIR = "state"
-os.makedirs(DATA_DIR, exist_ok=True)
-os.makedirs(STATE_DIR, exist_ok=True)
+DATA_DIR  = pathlib.Path("data")
+LOG_DIR   = DATA_DIR / "logs"
+DEBUG_LAST_HTML = DATA_DIR / "_debug_last_response.html"
+DEBUG_LAST_URL  = DATA_DIR / "_debug_last_url.txt"
+DEBUG_ERROR     = DATA_DIR / "_debug_error.json"
 
-def log(*a):
-    if DEBUG:
-        print("[dpwt]", *a, flush=True)
+USER_AGENT = os.getenv("DPWT_USER_AGENT", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                                         "AppleWebKit/537.36 (KHTML, like Gecko) "
+                                         "Chrome/120.0.0.0 Safari/537.36")
 
-def now_utc() -> str:
-    return dt.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+TZ = "Europe/Berlin"
 
-def current_season() -> int:
-    return dt.datetime.utcnow().year
 
-def write_json(path, obj):
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(obj, f, ensure_ascii=False, indent=2)
+# -------- Helpers: Files, JSON, Time --------
+def now_utc_iso() -> str:
+    return datetime.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
 
-def load_json(path, default):
+
+def now_local() -> datetime.datetime:
+    # “Pseudo”-Lokalzeit, reicht für Gate-Logic
+    return datetime.datetime.now()
+
+
+def ensure_dirs():
+    DATA_DIR.mkdir(exist_ok=True)
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def read_json(path: pathlib.Path, default=None):
     try:
-        with open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except:
-        return default
+        if path.exists():
+            return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        pass
+    return default
 
-def append_jsonl(path, obj):
-    with open(path, "a", encoding="utf-8") as f:
-        f.write(json.dumps(obj, ensure_ascii=False) + "\n")
 
-def write_text(path, text: str):
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(text)
+def write_json(path: pathlib.Path, obj: Any):
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(obj, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp.replace(path)
 
-def sha(obj) -> str:
-    return hashlib.sha256(json.dumps(obj, sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()[:12]
 
-def url_player_results(player_id: int, season: int) -> str:
-    return f"{BASE}/api/v1/players/{player_id}/results/{season}/?tourId={TOUR_ID}"
+def write_debug(step: str, err: str):
+    write_json(DEBUG_ERROR, {"ts": now_utc_iso(), "step": step, "error": err})
 
-def url_event_status() -> str:
-    return f"{BASE}/api/sportdata/Event/Status"
 
-def discord(payload: dict):
+def post_discord(text: str):
     if not WEBHOOK:
-        log("no DISCORD_WEBHOOK configured – skipping send")
-        return
-    try:
-        r = requests.post(WEBHOOK, json=payload, timeout=20)
-        log("discord post sent:", r.status_code)
-    except Exception as e:
-        log("discord error:", repr(e))
+        print("[dpwt] WARN: Kein DISCORD_WEBHOOK_URL gesetzt -> skip post")
+        return None
+    payload = {"content": text}
+    r = requests.post(WEBHOOK, json=payload, timeout=20)
+    print(f"[dpwt] discord post sent: {r.status_code}")
+    return r.status_code
 
-def ensure_baseline(season: int, items: List[dict]):
-    path = f"{DATA_DIR}/baseline-{season}.json"
-    if os.path.exists(path):
-        return False
-    baseline = {
-        "season": season,
-        "created": now_utc(),
-        "count": len(items),
-        "hash": sha(items),
-        "items": items
-    }
-    write_json(path, baseline)
-    discord({"content": f"Monitor aktiv. Baseline {season} gesetzt ({len(items)} Turniere)."})
-    log("baseline written:", path)
-    return True
 
-def save_last_check():
-    state = load_json(f"{STATE_DIR}/last_seen.json", {})
-    state["last_check_ts"] = now_utc()
-    write_json(f"{STATE_DIR}/last_seen.json", state)
+# -------- Domain-Logik: DPWT erkennen, Taktik (30min live / 2h sonst) --------
+def should_run_this_tick(live: bool) -> bool:
+    """
+    Actions-Schedule setzt *alle 30 Minuten* (siehe Workflow).
+    - Wenn live Event -> immer weiterlaufen (jede 30min)
+    - Wenn nicht live -> nur zu bestimmten Stunden (2h-Takt tagsüber)
+    """
+    t = now_local()
+    hour = t.hour
+    minute = t.minute
 
-def throttle_ok(is_live: bool):
-    st = load_json(f"{STATE_DIR}/last_seen.json", {})
-    last = st.get("last_check_ts")
-    if not last:
-        return True, "first"
-    if is_live:
-        # alle 30 Min bei Live-Event – erlaubt
-        return True, "live"
-    last_dt = dt.datetime.fromisoformat(last.replace("Z", ""))
-    if (dt.datetime.utcnow() - last_dt) >= dt.timedelta(hours=2):
-        return True, "2h-pass"
-    return False, "throttled"
+    # Tagesfenster (Berlin-Zeit): 07–21 Uhr
+    daytime_hours = {7, 9, 11, 13, 15, 17, 19, 21}
 
-def normalize_items(api_obj: Any) -> List[dict]:
-    if isinstance(api_obj, list):
-        return api_obj
-    if isinstance(api_obj, dict):
-        for k in ("Results", "results", "Items", "items", "Data", "data"):
-            v = api_obj.get(k)
-            if isinstance(v, list):
-                return v
-    return []
+    if live:
+        return True  # alle 30 Minuten durchlaufen
 
-def ev_key(ev: dict) -> str:
-    cid = ev.get("CompetitionId") or ev.get("EventId")
-    if cid:
-        return str(cid)
-    return sha([ev.get("Tournament") or ev.get("TournamentName"), ev.get("EndDate")])
-
-def round_fields(ev: dict):
-    return {
-        "R1": ev.get("R1"), "R2": ev.get("R2"), "R3": ev.get("R3"), "R4": ev.get("R4"),
-        "Total": ev.get("Total"), "ToPar": ev.get("ToPar"),
-        "Pos": ev.get("PositionText") or ev.get("Position") or ev.get("Pos")
-    }
-
-def post_round_update(name, rno, pos, strokes, total, url=None):
-    embed = {
-        "title": f"Runden-Update – {name}",
-        "url": url, "color": 0x2ecc71,
-        "fields": [
-            {"name": "Runde", "value": f"R{rno}", "inline": True},
-            {"name": "Pos.", "value": (pos or "–"), "inline": True},
-            {"name": f"Schläge R{rno}", "value": (strokes or "–"), "inline": True},
-            {"name": "Total (bis jetzt)", "value": (total or "–"), "inline": True},
-        ],
-        "footer": {"text": "DP World Tour – Marcel Schneider"},
-    }
-    discord({"embeds": [embed]})
-
-def post_final(ev):
-    name = ev.get("Tournament") or ev.get("TournamentName") or "Turnier"
-    embed = {
-        "title": f"Turnier beendet – {name}",
-        "url": ev.get("TournamentUrl") or ev.get("Link"),
-        "color": 0x3498db,
-        "fields": [
-            {"name": "End Date", "value": ev.get("EndDate") or "–", "inline": True},
-            {"name": "Pos.", "value": ev.get("PositionText") or "–", "inline": True},
-            {"name": "R2DR Points", "value": ev.get("R2DRPoints") or ev.get("R2DR") or "–", "inline": True},
-            {"name": "R2MR Points", "value": ev.get("R2MRPoints") or ev.get("R2MR") or "–", "inline": True},
-            {"name": "Prize Money", "value": ev.get("PrizeMoney") or "–", "inline": True},
-            {"name": "R1", "value": ev.get("R1") or "–", "inline": True},
-            {"name": "R2", "value": ev.get("R2") or "–", "inline": True},
-            {"name": "R3", "value": ev.get("R3") or "–", "inline": True},
-            {"name": "R4", "value": ev.get("R4") or "–", "inline": True},
-            {"name": "Total", "value": ev.get("Total") or "–", "inline": True},
-            {"name": "To Par", "value": ev.get("ToPar") or "–", "inline": True},
-        ],
-        "footer": {"text": "DP World Tour – Marcel Schneider"},
-    }
-    discord({"embeds": [embed]})
-
-def accept_consent_if_present(page: Page):
-    # OneTrust Variationen abdecken
-    for sel in ("#onetrust-accept-btn-handler", "button#onetrust-accept-btn-handler", "button[aria-label='Accept Cookies']"):
-        try:
-            page.wait_for_selector(sel, timeout=4000)
-            page.click(sel)
-            log("consent clicked")
-            break
-        except:
-            pass
-
-def has_live_event(context) -> bool:
-    try:
-        res: APIResponse = context.request.get(
-            url_event_status(),
-            headers={
-                "Accept": "application/json",
-                "Referer": f"{BASE}/dpworld-tour/",
-                "Origin": BASE,
-            },
-            max_redirects=5, timeout=45000
-        )
-        if not res.ok:
-            return False
-        data = res.json()
-        for ev in data or []:
-            if ev.get("TourId") == TOUR_ID and (ev.get("Status") in (1,2) or ev.get("RoundStatus") in (1,2)):
-                return True
-    except Exception as e:
-        log("live-check failed:", repr(e))
+    # nicht live: nur 2h-Korridor und exakt Minute == 0
+    if hour in daytime_hours and minute == 0:
+        return True
     return False
 
-def parse_json_maybe(text: str) -> Tuple[bool, Any]:
-    try:
-        return True, json.loads(text)
-    except:
-        return False, None
 
-def fetch_results_via_browser(context, season: int) -> Any:
-    api = url_player_results(PLAYER_ID, season)
-    page = context.new_page()
-    page.set_default_timeout(60000)
+# -------- Scrape: über Playwright + JS fetch (Same-Origin) --------
+def fetch_results_via_page(page, player_id: str, tour_id: str, season: int) -> Dict[str, Any]:
+    """
+    Lädt die Spieler-Seite, klickt Cookie-Consent, liest über window.fetch (im Browser-Kontext)
+    die JSON vom internen API-Endpunkt. Das vermeidet 403 von Edge/Akamai gegen “Bot-Clients”.
+    """
+    url = f"{BASE_URL}/players/{player_id}/results?tour=dpworld-tour"
+    page.set_default_timeout(30000)
+    page.goto(url, wait_until="domcontentloaded")
+    # Cookie Banner wegklicken (OneTrust)
     try:
-        page.goto(f"{BASE}/players/marcel-schneider-{PLAYER_ID}/results/?tour=dpworld-tour", wait_until="domcontentloaded")
-        accept_consent_if_present(page)
-    except PWTimeout:
-        log("page goto timeout (ok)")
-    # Primär: context.request (nimmt Cookies/Proxy mit)
-    res: APIResponse = context.request.get(
-        api,
-        headers={
-            "Accept": "application/json, text/plain, */*",
-            "Referer": f"{BASE}/players/marcel-schneider-{PLAYER_ID}/results/?tour=dpworld-tour",
-            "Origin": BASE,
-        },
-        max_redirects=5, timeout=60000
-    )
-    if res.ok:
-        ct = (res.headers.get("content-type") or "").lower()
-        body = res.text()
-        if "application/json" in ct:
-            page.close()
-            return res.json()
-        write_text(f"{DATA_DIR}/_debug_last_url.txt", api)
-        write_text(f"{DATA_DIR}/_debug_last_response.html", body)
-        log("context.request returned non-json; wrote _debug_last_response.html")
-    # Fallback: im Page-Kontext als Text
+        page.locator("#onetrust-accept-btn-handler").click(timeout=5000)
+        print("[dpwt] consent clicked")
+    except PWTimeoutError:
+        pass
+    except Exception:
+        pass
+
+    # Warte kurz, dann im Page-Kontext “fetch”
+    time.sleep(1.5)
+    api_url = f"/api/v1/players/{player_id}/results/{season}/?tourId={tour_id}"
+
     try:
-        js = f"""async () => {{
-          const r = await fetch("{api}", {{ credentials: "include" }});
-          const ct = r.headers.get("content-type") || "";
-          const t = await r.text();
-          return {{ status: r.status, ct, body: t }};
-        }}"""
-        obj = page.evaluate(js)
-        if obj and isinstance(obj, dict):
-            if "application/json" in (obj.get("ct","").lower()):
-                ok, val = parse_json_maybe(obj.get("body",""))
-                if ok:
-                    return val
-            write_text(f"{DATA_DIR}/_debug_last_url.txt", api)
-            write_text(f"{DATA_DIR}/_debug_last_response.html", obj.get("body",""))
-            log("page.fetch returned non-json; wrote _debug_last_response.html")
-    finally:
-        page.close()
-    raise RuntimeError("results fetch produced no JSON (see data/_debug_last_response.html)")
+        js = """
+        (async () => {
+          const u = arguments[0];
+          const res = await fetch(u, { credentials: 'same-origin' });
+          const ct = res.headers.get('content-type') || '';
+          const text = await res.text();
+          if (!ct.includes('application/json')) {
+            return { ok: false, url: u, contentType: ct, text: text };
+          }
+          try {
+            const data = JSON.parse(text);
+            return { ok: true, url: u, data: data };
+          } catch (e) {
+            return { ok: false, url: u, contentType: ct, text: text };
+          }
+        })();
+        """
+        result = page.evaluate(js, api_url)
+
+        if not result or not result.get("ok"):
+            # Debug dump, falls HTML (Access Denied / Captcha)
+            DEBUG_LAST_URL.write_text(result.get("url", api_url), encoding="utf-8")
+            DEBUG_LAST_HTML.write_text(result.get("text", ""), encoding="utf-8")
+            write_debug("fetch", "results fetch produced no JSON (see data/_debug_last_response.html)")
+            raise RuntimeError("results fetch produced no JSON (see data/_debug_last_response.html)")
+
+        return result["data"]
+    except Exception as e:
+        # Fallback: HTML dump der aktuellen Seite
+        try:
+            DEBUG_LAST_URL.write_text(api_url, encoding="utf-8")
+            DEBUG_LAST_HTML.write_text(page.content(), encoding="utf-8")
+        except Exception:
+            pass
+        write_debug("fetch", repr(e))
+        raise
+
+
+def extract_live_status(page) -> bool:
+    """
+    Prüft, ob im DOM ein live Event-Banner mit Status aktiv ist.
+    Grobe Heuristik: live-event-banner vorhanden und enthält RoundStatus/Status != 0.
+    """
+    try:
+        # Der Banner hängt als Custom Element im DOM; wir lesen dessen innerHTML
+        html = page.locator("live-event-banner").first.inner_html(timeout=3000)
+        # Quick heuristics
+        return "RoundNo" in html or "RoundStatus" in html or "Status" in html
+    except Exception:
+        return False
+
+
+def normalize_event(ev: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Mapped API-Felder auf dein gewünschtes Schema.
+    Der API-Shape enthält je nach Saison leicht andere Keys; wir sind defensiv.
+    """
+    # Kandidatenschlüssel (verschiedene Schreibweisen)
+    name = ev.get("EventName") or ev.get("Event") or ev.get("Tournament") or ev.get("Name") or ""
+    end_date = ev.get("EndDate") or ev.get("EventEndDate") or ev.get("Date") or ev.get("EventDate") or ""
+
+    def g(key_list, default=""):
+        for k in key_list:
+            if k in ev and ev[k] is not None:
+                return ev[k]
+        return default
+
+    out = {
+        "End Date": end_date,
+        "Tournament": name,
+        "Pos.": g(["Position", "Pos", "Pos."]),
+        "R2DR Points": g(["R2DRPoints", "R2DR Points"]),
+        "R2MR Points": g(["R2MRPoints", "R2MR Points"]),
+        "Prize Money": g(["PrizeMoney", "Prize Money", "Earnings"]),
+        "R1": g(["R1"]),
+        "R2": g(["R2"]),
+        "R3": g(["R3"]),
+        "R4": g(["R4"]),
+        "Total": g(["Total"]),
+        "To Par": g(["ToPar", "To Par"]),
+        # Für matching/ID:
+        "_EventId": g(["EventId", "EventID", "Id"]),
+    }
+
+    # “finished” Heuristik: Total mit Zahl + (R4 vorhanden ODER R3 vorhanden aber R4 fehlt (Cut))
+    total_raw = out["Total"]
+    total_ok = isinstance(total_raw, (str, int)) and str(total_raw).strip() not in ("", "-")
+    r4 = str(out["R4"] or "").strip()
+    r3 = str(out["R3"] or "").strip()
+    finished = False
+    if total_ok and (r4 or (r3 and not r4)):
+        finished = True
+    out["_finished"] = finished
+
+    return out
+
+
+def to_key(ev: Dict[str, Any]) -> str:
+    """
+    Stabiler Schlüssel pro Event: bevorzugt EventId, sonst Name+EndDate
+    """
+    eid = ev.get("_EventId")
+    if eid:
+        return f"id:{eid}"
+    return f"name:{ev.get('Tournament','')}|end:{ev.get('End Date','')}"
+
+
+def compare_baseline(old_list: List[Dict[str, Any]], new_list: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """
+    Liefert Diffs: new_tournaments, round_updates, finished_now (mit Vorher/Nachher).
+    “Round-Updates”: neue Werte in R1..R4 oder Positions-/ToPar-Änderungen.
+    """
+    old_map = {to_key(e): e for e in old_list}
+    new_map = {to_key(e): e for e in new_list}
+
+    changes = {
+        "new_tournaments": [],
+        "round_updates": [],
+        "finished_now": [],
+    }
+
+    # neue Turniere
+    for k, ev in new_map.items():
+        if k not in old_map:
+            changes["new_tournaments"].append(ev)
+
+    # Updates / “finished now”
+    for k, new_ev in new_map.items():
+        if k not in old_map:
+            continue
+        old_ev = old_map[k]
+
+        # Runden-Änderungen + Pos./To Par-Änderungen
+        fields = ["R1", "R2", "R3", "R4", "Pos.", "To Par", "Total", "Prize Money", "R2DR Points", "R2MR Points"]
+        diffs = {}
+        for f in fields:
+            if str(old_ev.get(f) or "") != str(new_ev.get(f) or ""):
+                diffs[f] = {"old": old_ev.get(f), "new": new_ev.get(f)}
+
+        if diffs:
+            changes["round_updates"].append({"event": new_ev, "diffs": diffs})
+
+        # Finished?
+        if not old_ev.get("_finished") and new_ev.get("_finished"):
+            changes["finished_now"].append({"event": new_ev, "before": old_ev})
+
+    return changes
+
+
+def format_round_post(ev: Dict[str, Any]) -> str:
+    # Kompakt, gut lesbar für Discord
+    lines = []
+    lines.append(f"**{ev.get('Tournament','(unbekannt)')}** – Zwischenstand")
+    if ev.get("Pos."):   lines.append(f"Platzierung: **{ev['Pos.']}**")
+    if ev.get("To Par"): lines.append(f"To Par: **{ev['To Par']}**")
+    # Runden, nur die gefüllten
+    for r in ["R1", "R2", "R3", "R4"]:
+        v = str(ev.get(r) or "").strip()
+        if v and v != "-":
+            lines.append(f"{r}: **{v}**")
+    if ev.get("Total"):  lines.append(f"Total: **{ev['Total']}**")
+    return "\n".join(lines)
+
+
+def format_finished_post(ev: Dict[str, Any]) -> str:
+    lines = []
+    lines.append(f"**{ev.get('Tournament','(unbekannt)')}** – beendet ✅")
+    if ev.get("Pos."):         lines.append(f"Endplatzierung: **{ev['Pos.']}**")
+    if ev.get("To Par"):       lines.append(f"To Par: **{ev['To Par']}**")
+    if ev.get("Total"):        lines.append(f"Total: **{ev['Total']}**")
+    if ev.get("Prize Money"):  lines.append(f"Preisgeld: **{ev['Prize Money']}**")
+    if ev.get("R2DR Points"):  lines.append(f"R2DR Punkte: **{ev['R2DR Points']}**")
+    if ev.get("R2MR Points"):  lines.append(f"R2MR Punkte: **{ev['R2MR Points']}**")
+    # Rundenübersicht immer anhängen:
+    rounds = " • ".join([f"{r}:{str(ev.get(r) or '-').strip()}" for r in ["R1","R2","R3","R4"]])
+    lines.append(rounds)
+    return "\n".join(lines)
+
 
 def main():
-    season = current_season()
-    raw_path = f"{DATA_DIR}/raw-{season}.json"
+    ensure_dirs()
 
-    # Proxy aus ENV (HTTP(S)_PROXY oder DPWT_PROXY)
-    proxy_url = os.environ.get("DPWT_PROXY") or os.environ.get("HTTPS_PROXY") or os.environ.get("HTTP_PROXY")
-    headless = os.environ.get("HEADLESS", "1") != "0"  # HEADLESS=0 → headful
+    # Jahr ermitteln (lokal, Berlin-Zeit), damit 2026 automatisch weiterläuft
+    season = int(SEASON) if SEASON else now_local().year
+    baseline_path = DATA_DIR / f"baseline-{season}.json"
 
-    with sync_playwright() as pw:
-        launch_kwargs = {"headless": headless, "args": ["--no-sandbox"]}
-        if proxy_url:
-            launch_kwargs["proxy"] = {"server": proxy_url}
-            log(f"using proxy: {proxy_url.split('@')[-1]}")
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True, args=["--no-sandbox"])
+        context = browser.new_context(
+            user_agent=USER_AGENT,
+            locale="en-GB",
+            timezone_id="Europe/Berlin"
+        )
+        page = context.new_page()
 
-        browser = pw.chromium.launch(**launch_kwargs)
-        context_kwargs = {
-            "user_agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/118 Safari/537.36",
-            "locale": "de-DE",
-            "viewport": {"width": 1366, "height": 768},
-        }
-        if proxy_url:
-            context_kwargs["proxy"] = {"server": proxy_url}
-
-        context = browser.new_context(**context_kwargs)
-
-        # JSON holen
         try:
-            raw = fetch_results_via_browser(context, season)
-        except Exception as e:
-            write_json(f"{DATA_DIR}/_debug_error.json", {"ts": now_utc(), "step": "fetch", "error": repr(e)})
-            log("fetch failed, wrote _debug_error.json", repr(e))
-            context.close(); browser.close()
-            return
+            # 1) Daten holen
+            data = fetch_results_via_page(page, PLAYER_ID, TOUR_ID, season)
+            # Live-Status prüfen (steuert 30min vs. 2h)
+            live = extract_live_status(page)
 
-        # Rohdump speichern
-        write_json(raw_path, raw)
+            # Gate: falls nicht “dran”, beenden (aber Baseline sicherstellen)
+            if not should_run_this_tick(live):
+                # Baseline ggf. initial setzen
+                if not baseline_path.exists():
+                    events = [normalize_event(e) for e in (data or [])]
+                    write_json(baseline_path, {"ts": now_utc_iso(), "season": season, "tournaments": events})
+                    if WEBHOOK:
+                        post_discord(f"Turniertracker\nMonitor aktiv. Baseline {season} gesetzt ({len(events)} Turniere).")
+                print("[dpwt] skip tick (nicht live & nicht im 2h-Fenster)")
+                return
 
-        items = normalize_items(raw)
-        if not items:
-            write_json(f"{DATA_DIR}/_debug_warning.json", {"ts": now_utc(), "step": "normalize", "note": "0 items – check raw & debug html"})
-            ensure_baseline(season, [])
-            save_last_check()
-            context.close(); browser.close()
-            return
+            # 2) Normalisieren
+            events = [normalize_event(e) for e in (data or [])]
 
-        ensure_baseline(season, items)
+            # 3) Baseline lesen/setzen
+            baseline = read_json(baseline_path, default=None)
+            first_run = baseline is None
+            if first_run:
+                write_json(baseline_path, {"ts": now_utc_iso(), "season": season, "tournaments": events})
+                if WEBHOOK:
+                    post_discord(f"Turniertracker\nMonitor aktiv. Baseline {season} gesetzt ({len(events)} Turniere).")
+                print(f"[dpwt] baseline written: {baseline_path}")
+                return
 
-        live = has_live_event(context)
-        ok, _ = throttle_ok(live)
-        if not ok:
-            context.close(); browser.close()
-            return
+            old_events = baseline.get("tournaments", [])
+            # 4) Diff
+            changes = compare_baseline(old_events, events)
 
-        state = load_json(f"{STATE_DIR}/events.json", {"events": {}})
-        events = state["events"]
-        hist = f"{DATA_DIR}/history-{season}.jsonl"
+            if not (changes["new_tournaments"] or changes["round_updates"] or changes["finished_now"]):
+                print("[dpwt] no changes")
+                return
 
-        for ev in items:
-            key = ev_key(ev)
-            name = ev.get("Tournament") or ev.get("TournamentName") or "Turnier"
-            events.setdefault(key, {"rounds": {}, "finished": False, "name": name})
+            # 5) Log schreiben
+            ts = datetime.datetime.utcnow().strftime("%Y-%m-%dT%H-%M-%S")
+            log_path = LOG_DIR / f"{ts}.json"
+            log_obj = {
+                "ts": now_utc_iso(),
+                "season": season,
+                "live": live,
+                "changes": changes
+            }
+            write_json(log_path, log_obj)
 
-            rdat = round_fields(ev)
-            for rno in (1,2,3,4):
-                col = f"R{rno}"
-                val = (rdat.get(col) or "").strip() if rdat.get(col) else ""
-                if val and events[key]["rounds"].get(str(rno)) != val:
-                    post_round_update(name, rno, rdat.get("Pos"), val, rdat.get("Total"), ev.get("Link") or ev.get("TournamentUrl"))
-                    events[key]["rounds"][str(rno)] = val
-                    append_jsonl(hist, {"ts": now_utc(), "type": "round", "eventKey": key, "round": rno,
-                                        "position": rdat.get("Pos"), "strokes": val, "total": rdat.get("Total"),
-                                        "tournament": name})
+            # 6) Discord Posts
+            posts: List[str] = []
 
-            finished = bool((ev.get("Total") or "").strip()) and ((ev.get("R4") or ev.get("R3") or "").strip())
-            if finished and not events[key]["finished"]:
-                post_final(ev)
-                events[key]["finished"] = True
-                append_jsonl(hist, {"ts": now_utc(), "type": "finished", "eventKey": key,
-                                    "tournament": name, "snapshot": ev})
+            for ev in changes["new_tournaments"]:
+                name = ev.get("Tournament", "(unbekannt)")
+                posts.append(f"**Neues Turnier im Kalender:** {name}\nEnddatum: {ev.get('End Date','-')}")
 
-        write_json(f"{STATE_DIR}/events.json", state)
-        save_last_check()
-        context.close(); browser.close()
+            # Round-Updates: poste kompakt (ein Post pro Event)
+            for item in changes["round_updates"]:
+                ev = item["event"]
+                posts.append(format_round_post(ev))
+
+            for item in changes["finished_now"]:
+                ev = item["event"]
+                posts.append(format_finished_post(ev))
+
+            for content in posts:
+                post_discord(content)
+                time.sleep(0.5)  # minimaler Puffer
+
+            # 7) Baseline aktualisieren
+            write_json(baseline_path, {"ts": now_utc_iso(), "season": season, "tournaments": events})
+            print(f"[dpwt] baseline updated ({baseline_path})")
+
+        finally:
+            try:
+                context.close()
+                browser.close()
+            except Exception:
+                pass
+
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as e:
+        write_debug("main", repr(e))
+        print(f"[dpwt] ERROR: {e}", file=sys.stderr)
+        sys.exit(1)
