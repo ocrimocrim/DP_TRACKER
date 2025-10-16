@@ -1,7 +1,7 @@
-import os, json, hashlib, datetime as dt
-from typing import Any, List
+import os, json, hashlib, datetime as dt, re
+from typing import Any, List, Tuple
 import requests
-from playwright.sync_api import sync_playwright, APIResponse, TimeoutError as PWTimeout
+from playwright.sync_api import sync_playwright, APIResponse, TimeoutError as PWTimeout, Page
 
 DEBUG = os.environ.get("DEBUG") == "1"
 WEBHOOK = os.environ.get("DISCORD_WEBHOOK")
@@ -40,6 +40,10 @@ def append_jsonl(path, obj):
     with open(path, "a", encoding="utf-8") as f:
         f.write(json.dumps(obj, ensure_ascii=False) + "\n")
 
+def write_text(path, text: str):
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(text)
+
 def sha(obj) -> str:
     return hashlib.sha256(json.dumps(obj, sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()[:12]
 
@@ -54,8 +58,8 @@ def discord(payload: dict):
         log("no DISCORD_WEBHOOK configured – skipping send")
         return
     try:
-        requests.post(WEBHOOK, json=payload, timeout=20)
-        log("discord post sent")
+        r = requests.post(WEBHOOK, json=payload, timeout=20)
+        log("discord post sent:", r.status_code)
     except Exception as e:
         log("discord error:", repr(e))
 
@@ -86,7 +90,7 @@ def throttle_ok(is_live: bool):
     if not last:
         return True, "first"
     if is_live:
-        # alle 30 Min (Runner läuft ohnehin alle 30 Min)
+        # alle 30 Min (Runner cron), passt
         return True, "live"
     last_dt = dt.datetime.fromisoformat(last.replace("Z",""))
     if (dt.datetime.utcnow() - last_dt) >= dt.timedelta(hours=2):
@@ -122,9 +126,9 @@ def post_round_update(name, rno, pos, strokes, total, url=None):
         "url": url, "color": 0x2ecc71,
         "fields": [
             {"name": "Runde", "value": f"R{rno}", "inline": True},
-            {"name": "Pos.", "value": pos or "–", "inline": True},
-            {"name": f"Schläge R{rno}", "value": strokes or "–", "inline": True},
-            {"name": "Total (bis jetzt)", "value": total or "–", "inline": True},
+            {"name": "Pos.", "value": (pos or "–"), "inline": True},
+            {"name": f"Schläge R{rno}", "value": (strokes or "–"), "inline": True},
+            {"name": "Total (bis jetzt)", "value": (total or "–"), "inline": True},
         ],
         "footer": {"text": "DP World Tour – Marcel Schneider"},
     }
@@ -153,9 +157,26 @@ def post_final(ev):
     }
     discord({"embeds": [embed]})
 
+def accept_consent_if_present(page: Page):
+    # OneTrust Standard-ID:
+    try:
+        page.wait_for_selector("#onetrust-accept-btn-handler", timeout=5000)
+        page.click("#onetrust-accept-btn-handler")
+        log("consent clicked")
+    except:
+        pass
+
 def has_live_event(context) -> bool:
     try:
-        res: APIResponse = context.request.get(url_event_status(), max_redirects=5, timeout=30000)
+        res: APIResponse = context.request.get(
+            url_event_status(),
+            headers={
+                "Accept": "application/json",
+                "Referer": f"{BASE}/dpworld-tour/",
+                "Origin": BASE,
+            },
+            max_redirects=5, timeout=45000
+        )
         if not res.ok:
             return False
         data = res.json()
@@ -166,22 +187,65 @@ def has_live_event(context) -> bool:
         log("live-check failed:", repr(e))
     return False
 
+def parse_json_maybe(text: str) -> Tuple[bool, Any]:
+    try:
+        return True, json.loads(text)
+    except:
+        return False, None
+
 def fetch_results_via_browser(context, season: int) -> Any:
     api = url_player_results(PLAYER_ID, season)
-    # 1) Versuch: über context.request (nimmt Cookies/Headers aus Browser-Kontext)
-    res: APIResponse = context.request.get(api, headers={"Accept": "application/json"}, max_redirects=5, timeout=45000)
-    if res.ok:
-        return res.json()
-    # 2) Fallback: innerhalb der Seite via fetch() (same-origin, nutzt JS-Stack)
+    # 0) Seite aufrufen, damit Cookies/Headers/Consent da sind
     page = context.new_page()
     try:
-        page.goto(f"{BASE}/players/marcel-schneider-{PLAYER_ID}/results/?tour=dpworld-tour", timeout=60000)
-        page.wait_for_load_state("domcontentloaded")
-        js = f"""() => fetch("{api}", {{credentials:"include"}}).then(r => r.json())"""
-        data = page.evaluate(js)
-        return data
+        page.goto(f"{BASE}/players/marcel-schneider-{PLAYER_ID}/results/?tour=dpworld-tour", timeout=60000, wait_until="domcontentloaded")
+        accept_consent_if_present(page)
+    except PWTimeout:
+        log("page goto timeout (ok)")
+
+    # 1) Primär: context.request (nimmt Browser-Cookies mit)
+    res: APIResponse = context.request.get(
+        api,
+        headers={
+            "Accept": "application/json, text/plain, */*",
+            "Referer": f"{BASE}/players/marcel-schneider-{PLAYER_ID}/results/?tour=dpworld-tour",
+            "Origin": BASE,
+        },
+        max_redirects=5, timeout=45000
+    )
+    if res.ok:
+        ct = (res.headers.get("content-type") or "").lower()
+        body = res.text()
+        if "application/json" in ct:
+            return res.json()
+        else:
+            # Unerwartet HTML? Wegschreiben.
+            write_text(f"{DATA_DIR}/_debug_last_url.txt", api)
+            write_text(f"{DATA_DIR}/_debug_last_response.html", body)
+            log("context.request returned non-json; wrote _debug_last_response.html")
+
+    # 2) Fallback im Page-Kontext: immer als Text holen, dann parsen
+    try:
+        js = f"""async () => {{
+          const r = await fetch("{api}", {{ credentials: "include" }});
+          const ct = r.headers.get("content-type") || "";
+          const t = await r.text();
+          return {{ status: r.status, ct, body: t }};
+        }}"""
+        obj = page.evaluate(js)
+        if obj and isinstance(obj, dict):
+            if "application/json" in (obj.get("ct","").lower()):
+                ok, val = parse_json_maybe(obj.get("body",""))
+                if ok:
+                    return val
+            # HTML/sonstiges: debug dump
+            write_text(f"{DATA_DIR}/_debug_last_url.txt", api)
+            write_text(f"{DATA_DIR}/_debug_last_response.html", obj.get("body",""))
+            log("page.fetch returned non-json; wrote _debug_last_response.html")
     finally:
         page.close()
+
+    raise RuntimeError("results fetch produced no JSON (see data/_debug_last_response.html)")
 
 def main():
     season = current_season()
@@ -193,15 +257,8 @@ def main():
             user_agent="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/118 Safari/537.36",
             locale="de-DE",
         )
-        page = context.new_page()
-        try:
-            # Seite aufrufen, damit Consent/Cookies/Headers gesetzt werden
-            page.goto(f"{BASE}/players/marcel-schneider-{PLAYER_ID}/results/?tour=dpworld-tour", timeout=60000)
-            page.wait_for_load_state("domcontentloaded")
-        except PWTimeout:
-            pass  # selbst wenn Werbung/CMP blockiert – das reicht für Cookies
 
-        # JSON holen (mit Cookies)
+        # JSON holen (mit Cookies & Consent)
         try:
             raw = fetch_results_via_browser(context, season)
         except Exception as e:
@@ -216,11 +273,11 @@ def main():
         items = normalize_items(raw)
         log("items:", len(items))
         if not items:
-            write_json(f"{DATA_DIR}/_debug_warning.json", {"ts": now_utc(), "step": "normalize", "note": "0 items – check raw"})
-            context.close(); browser.close()
-            # baseline trotzdem schreiben (leer), damit du siehst, dass es lief
+            write_json(f"{DATA_DIR}/_debug_warning.json", {"ts": now_utc(), "step": "normalize", "note": "0 items – check raw & debug html"})
+            # baseline trotzdem schreiben (leer)
             ensure_baseline(season, [])
             save_last_check()
+            context.close(); browser.close()
             return
 
         # Baseline zuerst
