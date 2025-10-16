@@ -21,6 +21,7 @@ USER_AGENTS = [
 ]
 
 session = requests.Session()
+_PW_READY = False  # Playwright-Install-Flag
 
 # ---------- Helpers: Header, Fetch ----------
 def headers():
@@ -52,15 +53,36 @@ def fetch_json_requests(url, retries=4):
     raise last
 
 def ensure_playwright():
-    try:
-        import playwright  # noqa
+    """Installiert eine verfügbare Playwright-Version, ohne harten Pin."""
+    global _PW_READY
+    if _PW_READY:
         return
+    try:
+        # probier vorhandene Installation
+        from playwright.sync_api import sync_playwright  # noqa: F401
     except Exception:
-        subprocess.check_call([sys.executable, "-m", "pip", "install", "playwright==1.47.2"])
-        subprocess.check_call([sys.executable, "-m", "playwright", "install", "chromium"])
+        # versuche nacheinander bekannte Versionen, dann latest
+        for pkg in ("playwright==1.55.0", "playwright==1.54.0", "playwright"):
+            try:
+                subprocess.check_call([sys.executable, "-m", "pip", "install", pkg])
+                break
+            except Exception:
+                continue
+    # Browser installieren (Chromium)
+    try:
+        subprocess.check_call([sys.executable, "-m", "playwright", "install", "chromium", "--with-deps"])
+        # prüfe Import
+        from playwright.sync_api import sync_playwright  # noqa: F401
+        _PW_READY = True
+    except Exception as e:
+        _PW_READY = False
+        # Kein harter Abbruch: Fallback bleibt deaktiviert, requests wird genutzt.
+        print(f"Playwright-Setup nicht verfügbar: {e}")
 
 def fetch_json_playwright(url):
     ensure_playwright()
+    if not _PW_READY:
+        raise RuntimeError("Playwright nicht verfügbar")
     from playwright.sync_api import sync_playwright
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
@@ -68,6 +90,7 @@ def fetch_json_playwright(url):
         req = ctx.request
         resp = req.get(url, headers={"Referer": "https://www.europeantour.com/", "Origin": "https://www.europeantour.com"})
         if resp.status >= 400:
+            browser.close()
             raise RuntimeError(f"playwright status {resp.status}")
         data = resp.json()
         browser.close()
@@ -77,6 +100,7 @@ def fetch_results():
     try:
         return fetch_json_requests(API_URL)
     except Exception:
+        # nur wenn requests scheitert (z. B. 403), Playwright benutzen
         return fetch_json_playwright(API_URL)
 
 def iso_to_dt(s):
@@ -336,6 +360,8 @@ def run_once_and_post():
     # außerhalb aktiver Turniere: nur alle 4h wirklich arbeiten
     if not active and now - last_full < timedelta(hours=4):
         print("inaktiv: 4h-Fenster noch offen")
+        state["last_full_check"] = now.isoformat().replace("+00:00","Z")
+        state_save(state)
         return False
 
     # aktive Runden posten (nur Änderungen)
@@ -375,7 +401,7 @@ def run_once_and_post():
 
 # ---------- Hauptprogramm: 4h-Run, bei aktivem Event 30-Min-Watch im selben Job ----------
 if __name__ == "__main__":
-    # Einmal ausführen
+    # Erster Lauf (mit Retries)
     active = False
     for i in range(3):
         try:
@@ -385,10 +411,10 @@ if __name__ == "__main__":
             print(f"retry {i+1} wegen {e}")
             time.sleep(2 + i*3)
 
-    # Wenn aktiv, dann im selben Job alle 30 Minuten weiterprüfen (max. 12h)
+    # Wenn aktiv, dann im selben Job alle 30 Minuten weiterprüfen (max. 72h)
     if active:
         print("Aktives Turnier erkannt → 30-Minuten-Watch gestartet.")
-        end_watch = time.time() + 12 * 3600  # maximal 12 Stunden beobachten
+        end_watch = time.time() + 72 * 3600  # maximal 72 Stunden beobachten
         while time.time() < end_watch:
             time.sleep(30 * 60)  # 30 Minuten warten
             try:
