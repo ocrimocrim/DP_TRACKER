@@ -1,4 +1,4 @@
-import os, json, hashlib, datetime as dt, re
+import os, json, hashlib, datetime as dt
 from typing import Any, List, Tuple
 import requests
 from playwright.sync_api import sync_playwright, APIResponse, TimeoutError as PWTimeout, Page
@@ -15,12 +15,12 @@ STATE_DIR = "state"
 os.makedirs(DATA_DIR, exist_ok=True)
 os.makedirs(STATE_DIR, exist_ok=True)
 
-def log(*a): 
-    if DEBUG: 
+def log(*a):
+    if DEBUG:
         print("[dpwt]", *a, flush=True)
 
 def now_utc() -> str:
-    return dt.datetime.utcnow().replace(microsecond=0).isoformat()+"Z"
+    return dt.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
 
 def current_season() -> int:
     return dt.datetime.utcnow().year
@@ -90,18 +90,18 @@ def throttle_ok(is_live: bool):
     if not last:
         return True, "first"
     if is_live:
-        # alle 30 Min (Runner cron), passt
+        # alle 30 Min bei Live-Event – erlaubt
         return True, "live"
-    last_dt = dt.datetime.fromisoformat(last.replace("Z",""))
+    last_dt = dt.datetime.fromisoformat(last.replace("Z", ""))
     if (dt.datetime.utcnow() - last_dt) >= dt.timedelta(hours=2):
         return True, "2h-pass"
     return False, "throttled"
 
 def normalize_items(api_obj: Any) -> List[dict]:
-    if isinstance(api_obj, list): 
+    if isinstance(api_obj, list):
         return api_obj
     if isinstance(api_obj, dict):
-        for k in ("Results","results","Items","items","Data","data"):
+        for k in ("Results", "results", "Items", "items", "Data", "data"):
             v = api_obj.get(k)
             if isinstance(v, list):
                 return v
@@ -109,7 +109,7 @@ def normalize_items(api_obj: Any) -> List[dict]:
 
 def ev_key(ev: dict) -> str:
     cid = ev.get("CompetitionId") or ev.get("EventId")
-    if cid: 
+    if cid:
         return str(cid)
     return sha([ev.get("Tournament") or ev.get("TournamentName"), ev.get("EndDate")])
 
@@ -158,13 +158,15 @@ def post_final(ev):
     discord({"embeds": [embed]})
 
 def accept_consent_if_present(page: Page):
-    # OneTrust Standard-ID:
-    try:
-        page.wait_for_selector("#onetrust-accept-btn-handler", timeout=5000)
-        page.click("#onetrust-accept-btn-handler")
-        log("consent clicked")
-    except:
-        pass
+    # OneTrust Variationen abdecken
+    for sel in ("#onetrust-accept-btn-handler", "button#onetrust-accept-btn-handler", "button[aria-label='Accept Cookies']"):
+        try:
+            page.wait_for_selector(sel, timeout=4000)
+            page.click(sel)
+            log("consent clicked")
+            break
+        except:
+            pass
 
 def has_live_event(context) -> bool:
     try:
@@ -195,15 +197,14 @@ def parse_json_maybe(text: str) -> Tuple[bool, Any]:
 
 def fetch_results_via_browser(context, season: int) -> Any:
     api = url_player_results(PLAYER_ID, season)
-    # 0) Seite aufrufen, damit Cookies/Headers/Consent da sind
     page = context.new_page()
+    page.set_default_timeout(60000)
     try:
-        page.goto(f"{BASE}/players/marcel-schneider-{PLAYER_ID}/results/?tour=dpworld-tour", timeout=60000, wait_until="domcontentloaded")
+        page.goto(f"{BASE}/players/marcel-schneider-{PLAYER_ID}/results/?tour=dpworld-tour", wait_until="domcontentloaded")
         accept_consent_if_present(page)
     except PWTimeout:
         log("page goto timeout (ok)")
-
-    # 1) Primär: context.request (nimmt Browser-Cookies mit)
+    # Primär: context.request (nimmt Cookies/Proxy mit)
     res: APIResponse = context.request.get(
         api,
         headers={
@@ -211,20 +212,18 @@ def fetch_results_via_browser(context, season: int) -> Any:
             "Referer": f"{BASE}/players/marcel-schneider-{PLAYER_ID}/results/?tour=dpworld-tour",
             "Origin": BASE,
         },
-        max_redirects=5, timeout=45000
+        max_redirects=5, timeout=60000
     )
     if res.ok:
         ct = (res.headers.get("content-type") or "").lower()
         body = res.text()
         if "application/json" in ct:
+            page.close()
             return res.json()
-        else:
-            # Unerwartet HTML? Wegschreiben.
-            write_text(f"{DATA_DIR}/_debug_last_url.txt", api)
-            write_text(f"{DATA_DIR}/_debug_last_response.html", body)
-            log("context.request returned non-json; wrote _debug_last_response.html")
-
-    # 2) Fallback im Page-Kontext: immer als Text holen, dann parsen
+        write_text(f"{DATA_DIR}/_debug_last_url.txt", api)
+        write_text(f"{DATA_DIR}/_debug_last_response.html", body)
+        log("context.request returned non-json; wrote _debug_last_response.html")
+    # Fallback: im Page-Kontext als Text
     try:
         js = f"""async () => {{
           const r = await fetch("{api}", {{ credentials: "include" }});
@@ -238,27 +237,39 @@ def fetch_results_via_browser(context, season: int) -> Any:
                 ok, val = parse_json_maybe(obj.get("body",""))
                 if ok:
                     return val
-            # HTML/sonstiges: debug dump
             write_text(f"{DATA_DIR}/_debug_last_url.txt", api)
             write_text(f"{DATA_DIR}/_debug_last_response.html", obj.get("body",""))
             log("page.fetch returned non-json; wrote _debug_last_response.html")
     finally:
         page.close()
-
     raise RuntimeError("results fetch produced no JSON (see data/_debug_last_response.html)")
 
 def main():
     season = current_season()
     raw_path = f"{DATA_DIR}/raw-{season}.json"
 
-    with sync_playwright() as pw:
-        browser = pw.chromium.launch(headless=True, args=["--no-sandbox"])
-        context = browser.new_context(
-            user_agent="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/118 Safari/537.36",
-            locale="de-DE",
-        )
+    # Proxy aus ENV (HTTP(S)_PROXY oder DPWT_PROXY)
+    proxy_url = os.environ.get("DPWT_PROXY") or os.environ.get("HTTPS_PROXY") or os.environ.get("HTTP_PROXY")
+    headless = os.environ.get("HEADLESS", "1") != "0"  # HEADLESS=0 → headful
 
-        # JSON holen (mit Cookies & Consent)
+    with sync_playwright() as pw:
+        launch_kwargs = {"headless": headless, "args": ["--no-sandbox"]}
+        if proxy_url:
+            launch_kwargs["proxy"] = {"server": proxy_url}
+            log(f"using proxy: {proxy_url.split('@')[-1]}")
+
+        browser = pw.chromium.launch(**launch_kwargs)
+        context_kwargs = {
+            "user_agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/118 Safari/537.36",
+            "locale": "de-DE",
+            "viewport": {"width": 1366, "height": 768},
+        }
+        if proxy_url:
+            context_kwargs["proxy"] = {"server": proxy_url}
+
+        context = browser.new_context(**context_kwargs)
+
+        # JSON holen
         try:
             raw = fetch_results_via_browser(context, season)
         except Exception as e:
@@ -267,31 +278,25 @@ def main():
             context.close(); browser.close()
             return
 
-        # Rohdump immer speichern
+        # Rohdump speichern
         write_json(raw_path, raw)
 
         items = normalize_items(raw)
-        log("items:", len(items))
         if not items:
             write_json(f"{DATA_DIR}/_debug_warning.json", {"ts": now_utc(), "step": "normalize", "note": "0 items – check raw & debug html"})
-            # baseline trotzdem schreiben (leer)
             ensure_baseline(season, [])
             save_last_check()
             context.close(); browser.close()
             return
 
-        # Baseline zuerst
         ensure_baseline(season, items)
 
-        # Throttle
         live = has_live_event(context)
-        ok, reason = throttle_ok(live)
-        log("throttle:", reason, "live" if live else "not-live")
+        ok, _ = throttle_ok(live)
         if not ok:
             context.close(); browser.close()
             return
 
-        # State laden
         state = load_json(f"{STATE_DIR}/events.json", {"events": {}})
         events = state["events"]
         hist = f"{DATA_DIR}/history-{season}.jsonl"
@@ -322,7 +327,6 @@ def main():
         write_json(f"{STATE_DIR}/events.json", state)
         save_last_check()
         context.close(); browser.close()
-        log("done")
 
 if __name__ == "__main__":
     main()
