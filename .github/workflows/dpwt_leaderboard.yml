@@ -3,45 +3,35 @@ name: DPWT Leaderboard Watcher
 on:
   workflow_dispatch:
   schedule:
-    - cron: "*/30 * * * *"  # alle 30 Minuten
-
-env:
-  API_URL: https://www.europeantour.com/api/v1/players/35703/results/2025/
-  # Setze auf "1", falls du wirklich den Playwright-Fallback brauchst.
-  USE_PLAYWRIGHT: "0"
+    - cron: "0 */4 * * *"  # alle 4 Stunden
 
 jobs:
   run:
     runs-on: ubuntu-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+    timeout-minutes: 10
 
-      - name: Set up Python
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-          cache: "pip"
 
-      - name: Install pip deps (schnell)
+      - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install requests beautifulsoup4
+          pip install requests beautifulsoup4 playwright
+          playwright install --with-deps chromium
 
-      # Nur wenn USE_PLAYWRIGHT=1 → schwere Browser-Installation
-      - name: Install Playwright (optional)
-        if: env.USE_PLAYWRIGHT == '1'
-        run: |
-          pip install playwright==1.55.0 || pip install playwright
-          python -m playwright install chromium --with-deps
-
-      - name: Run bot
-        env:
-          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          GH_REPO: ${{ github.repository }}
-          STATE_ISSUE_NUMBER: ${{ vars.STATE_ISSUE_NUMBER }}
-          API_URL: ${{ env.API_URL }}
-          USE_PLAYWRIGHT: ${{ env.USE_PLAYWRIGHT }}
+      - name: Run DPWT Leaderboard Watcher
         run: |
           python ms_leaderboard_bot.py || true
+
+      - name: Upload Debug Logs
+        uses: actions/upload-artifact@v4
+        with:
+          name: dpwt-debug-${{ github.run_id }}
+          path: |
+            *.log
+            last_run_state.json
