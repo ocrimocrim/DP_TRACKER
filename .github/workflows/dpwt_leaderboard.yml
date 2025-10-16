@@ -1,47 +1,37 @@
 name: DPWT Leaderboard Watcher
 
 on:
-  workflow_dispatch:
   schedule:
-    # 1) Einmal täglich zum Einsammeln des nächsten Turniers + Pre-Event-Ping
-    - cron: "07 5 * * *"
-    # 2) Alle 30 Minuten (während Turnieren für Round-Status)
-    - cron: "*/30 * * * *"
+    - cron: "0 6 * * *"   # täglich 06:00 UTC (07:00/08:00 Deutschland)
+  workflow_dispatch:
 
 jobs:
   run:
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      actions: write
     steps:
       - uses: actions/checkout@v4
 
-      - name: Setup Python
-      - uses: actions/setup-python@v5
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: Install deps
+      - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install requests beautifulsoup4
+          pip install requests beautifulsoup4 playwright
+          playwright install --with-deps chromium
 
-      - name: Run bot
+      - name: Run MS Leaderboard Watcher
         env:
-          DPWT_PLAYER_ID: "35703"
-          DPWT_TOUR_SLUG: "dpworld-tour"
-          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
-          DISCORD_WEBHOOK_2: ${{ secrets.DISCORD_WEBHOOK_2 }}
-          PROXY_URL: ${{ secrets.PROXY_URL }}
+          DISCORD_WEBHOOK_MS: ${{ secrets.DISCORD_WEBHOOK_MS }}
         run: |
           python ms_leaderboard_bot.py || true
 
-      - name: Upload logs & JSON reports (artifact)
+      - name: Upload Logs
         uses: actions/upload-artifact@v4
         with:
           name: dpwt-debug-${{ github.run_id }}
           path: |
-            reports/logs/*.log
-            reports/*.json
-            reports/snapshots/**
+            dpwt_watcher_*.log
+            last_run.json
