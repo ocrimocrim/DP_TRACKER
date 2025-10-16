@@ -1,0 +1,26 @@
+name: DPWT to Discord
+
+on:
+  schedule:
+    - cron: "*/30 * * * *"   # alle 30 Minuten
+  workflow_dispatch:
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - run: pip install requests
+
+      - name: Run bot
+        env:
+          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}   # ist in Actions als Schreib-Token verfügbar
+          GH_REPO: ${{ github.repository }}          # owner/repo
+          STATE_ISSUE_NUMBER: ${{ vars.STATE_ISSUE_NUMBER }} # als Repository Variable setzen, z. B. 1
+        run: python bot.py
