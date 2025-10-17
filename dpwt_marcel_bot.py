@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 import os, re, json, logging, pathlib, datetime as dt, html
 from typing import Optional, Dict, Any, List
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlencode, urlparse, urlunparse
 import requests
 
 # ------------------------------------------
@@ -24,7 +24,7 @@ logging.basicConfig(
 
 SESSION = requests.Session()
 SESSION.headers.update({
-    "User-Agent": "dpwt-marcel-bot/1.5 (+github-actions)",
+    "User-Agent": "dpwt-marcel-bot/1.6 (+github-actions)",
     "Accept": "text/html,application/json"
 })
 
@@ -79,17 +79,12 @@ def build_leaderboard_page(event_page_url: str) -> str:
     return urljoin(event_page_url.rstrip("/") + "/", "leaderboard?round=4")
 
 # ------------------------------------------
-# Schritt 4 fortgesetzt
-# EventId ausschließlich von der Leaderboard-Seite extrahieren
+# Schritt 5
+# EventId nur über die Leaderboard-Seite ermitteln
 # ------------------------------------------
-EVENT_LOAD_URL_RX = re.compile(
-    r'/api/sportdata/Leaderboard/Strokeplay/(\d+)/type/load',
-    re.I
-)
-EVENT_ID_KEYPATH_RX = re.compile(
-    r'"(?:EventId|eventId)"\s*:\s*(\d+)',
-    re.I
-)
+EVENT_LOAD_URL_RX = re.compile(r'/api/sportdata/Leaderboard/Strokeplay/(\d+)/type/load', re.I)
+EVENT_ID_KEY_RX  = re.compile(r'"(?:EventId|eventId)"\s*:\s*(\d+)', re.I)
+LEADERBOARD_DOC_ID_RX = re.compile(r'"id"\s*:\s*"leaderboard-strokeplay-(\d+)"', re.I)
 
 def _event_id_from_text(html_text: str) -> Optional[int]:
     m = EVENT_LOAD_URL_RX.search(html_text)
@@ -98,16 +93,32 @@ def _event_id_from_text(html_text: str) -> Optional[int]:
             return int(m.group(1))
         except Exception:
             pass
+    m = LEADERBOARD_DOC_ID_RX.search(html_text)
+    if m:
+        try:
+            return int(m.group(1))
+        except Exception:
+            pass
+    m = EVENT_ID_KEY_RX.search(html_text)
+    if m:
+        try:
+            return int(m.group(1))
+        except Exception:
+            pass
+    # Eingebettete JSON-Blöcke durchsuchen
     for m in re.finditer(r'<script[^>]*>\s*({.*?})\s*</script>', html_text, re.S | re.I):
         block = m.group(1)
+        # Direkt versuchen
         try:
             j = json.loads(block)
         except Exception:
+            # Kommentare entfernen und erneut versuchen
             cleaned = re.sub(r'(?://.*?$)|/\*.*?\*/', '', block, flags=re.M | re.S)
             try:
                 j = json.loads(cleaned)
             except Exception:
                 continue
+        # Tiefensuche
         def walk(x):
             if isinstance(x, dict):
                 for k, v in x.items():
@@ -125,18 +136,72 @@ def _event_id_from_text(html_text: str) -> Optional[int]:
         got = walk(j)
         if got:
             return int(got)
-    m = EVENT_ID_KEYPATH_RX.search(html_text)
-    if m:
+    return None
+
+def _resolver_try(path: str) -> Optional[int]:
+    """
+    Manche Seiten liefern Metadaten über Resolver-APIs für genau diesen Pfad.
+    Ich teste mehrere übliche Resolver auf derselben Domain und lese eine zahlige EventId.
+    """
+    candidates = [
+        f"{BASE}/api/seo/resolve?{urlencode({'path': path})}",
+        f"{BASE}/api/cms/resolve?{urlencode({'path': path})}",
+        f"{BASE}/api/cms/page-resolver?{urlencode({'path': path})}",
+    ]
+    for url in candidates:
         try:
+            txt = _get(url, as_json=False)
+        except Exception as e:
+            logging.debug(f"resolver miss {url} because {e}")
+            continue
+        # EventId direkt
+        m = EVENT_ID_KEY_RX.search(txt)
+        if m:
             return int(m.group(1))
+        # oder Leaderboard-Doc-Id
+        m = LEADERBOARD_DOC_ID_RX.search(txt)
+        if m:
+            return int(m.group(1))
+        # oder Sportdata-URL
+        m = EVENT_LOAD_URL_RX.search(txt)
+        if m:
+            return int(m.group(1))
+        # Notfalls JSON parsen und tief suchen
+        try:
+            data = json.loads(txt)
         except Exception:
-            pass
+            for js in re.finditer(r'({.*?})', txt, re.S):
+                try:
+                    data = json.loads(js.group(1))
+                    break
+                except Exception:
+                    data = None
+                    continue
+        if data is None:
+            continue
+        def walk(x):
+            if isinstance(x, dict):
+                for k, v in x.items():
+                    if k in ("EventId", "eventId") and isinstance(v, int):
+                        return v
+                    got = walk(v)
+                    if got:
+                        return got
+            elif isinstance(x, list):
+                for v in x:
+                    got = walk(v)
+                    if got:
+                        return got
+            return None
+        got = walk(data)
+        if got:
+            return int(got)
     return None
 
 def extract_event_id(event_page_url: str) -> Optional[int]:
     lb_url = build_leaderboard_page(event_page_url)
 
-    # Versuch 1 über Jina-HTML der Leaderboard-Seite
+    # 1) Leaderboard HTML via Proxy
     try:
         html1 = _get(lb_url, allow_jina=True)
         eid = _event_id_from_text(html1)
@@ -146,7 +211,7 @@ def extract_event_id(event_page_url: str) -> Optional[int]:
     except Exception as e:
         logging.debug(f"LeaderBoard Jina miss because {e}")
 
-    # Versuch 2 direkt ohne Proxy
+    # 2) Leaderboard HTML direkt
     try:
         html2 = _get(lb_url, allow_jina=False)
         eid = _event_id_from_text(html2)
@@ -156,11 +221,24 @@ def extract_event_id(event_page_url: str) -> Optional[int]:
     except Exception as e:
         logging.debug(f"LeaderBoard direct miss because {e}")
 
+    # 3) Resolver für genau diesen Pfad (gleiche Seite, kein anderer Flow)
+    path = urlparse(lb_url).path  # nur Pfad ohne Domain und Query
+    eid = _resolver_try(path)
+    if eid:
+        logging.info(f"EventId Quelle Resolver {eid}")
+        return eid
+
+    # 4) Resolver zusätzlich ohne '?round=4' am Event-Wurzelpfad
+    root_path = urlparse(event_page_url).path.rstrip("/")
+    eid = _resolver_try(root_path)
+    if eid:
+        logging.info(f"EventId Quelle Resolver root {eid}")
+        return eid
+
     logging.info("EventId wurde nicht gefunden")
     return None
 
 # ------------------------------------------
-# Schritt 5
 # Sportdata APIs
 # ------------------------------------------
 def fetch_leaderboard(event_id: int) -> Dict[str, Any]:
