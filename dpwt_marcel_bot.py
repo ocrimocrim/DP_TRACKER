@@ -9,13 +9,12 @@ import requests
 # ------------------------------------------
 PLAYER_ID = 35703  # Marcel Schneider
 BASE = "https://www.europeantour.com"
-JINA = "https://r.jina.ai/http://"
 STATE_DIR = pathlib.Path(".state")
 STATE_DIR.mkdir(parents=True, exist_ok=True)
 
 DISCORD_WEBHOOK = os.environ.get("DISCORD_WEBHOOK_LIVE", "").strip()
 DEBUG = os.environ.get("DEBUG", "0") == "1"
-TZ = dt.timezone(dt.timedelta(hours=2))  # Europe Berlin grob
+TZ = dt.timezone(dt.timedelta(hours=2))  # grob Europe/Berlin
 
 logging.basicConfig(
     level=logging.DEBUG if DEBUG else logging.INFO,
@@ -24,136 +23,158 @@ logging.basicConfig(
 
 SESSION = requests.Session()
 SESSION.headers.update({
-    "User-Agent": "dpwt-marcel-bot/1.2 (+github-actions)",
-    "Accept": "text/html,application/json"
+    "User-Agent": "dpwt-marcel-bot/1.3 (+github-actions)",
+    "Accept": "application/json,text/html"
 })
 
 # ------------------------------------------
 # HTTP
 # ------------------------------------------
-def _get(url: str, as_json=False, allow_jina=False) -> Any:
-    try_urls = [url]
-    if allow_jina:
-        if url.startswith("https://"):
-            try_urls.insert(0, JINA + url[len("https://"):])
-        elif url.startswith("http://"):
-            try_urls.insert(0, JINA + url[len("http://"):])
-        else:
-            try_urls.insert(0, JINA + url)
-    last_err = None
-    for u in try_urls:
-        logging.debug(f"GET {u}")
-        try:
-            r = SESSION.get(u, timeout=25)
-            if r.status_code == 200:
-                return r.json() if as_json else r.text
-            last_err = f"HTTP {r.status_code}"
-        except Exception as e:
-            last_err = str(e)
-    raise RuntimeError(f"fetch failed for {url} because {last_err}")
+def _get(url: str, as_json=False) -> Any:
+    logging.debug(f"GET {url}")
+    r = SESSION.get(url, timeout=25)
+    if r.status_code != 200:
+        raise RuntimeError(f"http {r.status_code} for {url}")
+    return r.json() if as_json else r.text
 
 # ------------------------------------------
-# Discovery für Playing this week über API
+# Discovery „Playing this week“ ausschließlich per API
 # ------------------------------------------
-API_CANDIDATES = [
+API_DISCOVERY = [
+    # CMS Playerhub enthält Playing-this-week Blöcke
     "https://www.europeantour.com/api/cms/playerhub/{pid}?tour=dpworld-tour",
+    # Profil-Overview
     "https://www.europeantour.com/api/cms/player/{pid}/overview?tour=dpworld-tour",
+    # Individueller Spielplan des Spielers
     "https://www.europeantour.com/api/sportdata/Players/{pid}/Schedule?tour=dpworld-tour",
-    "https://www.europeantour.com/api/sportdata/Events/ThisWeek?tour=dpworld-tour",
-    "https://www.europeantour.com/players/marcel-schneider-{pid}/?tour=dpworld-tour"
+    # Alle Events dieser Woche
+    "https://www.europeantour.com/api/sportdata/Events/ThisWeek?tour=dpworld-tour"
 ]
 
-def _maybe_json(text: str) -> Optional[Any]:
-    try:
-        return json.loads(text)
-    except Exception:
-        for m in re.finditer(r'<script[^>]*>\s*({.*?})\s*</script>', text, re.S | re.I):
-            block = m.group(1)
-            cleaned = re.sub(r'(?://.*?$)|/\*.*?\*/', '', block, flags=re.M | re.S)
-            try:
-                return json.loads(cleaned)
-            except Exception:
-                continue
-    return None
+SLUG_RX = re.compile(r'/dpworld-tour/[^/]+-20\d{2}/?$', re.I)
 
-def _find_slug_in_json_blob(blob: Any) -> Optional[str]:
-    def scan(x):
+def _scan_for_slug(obj: Any) -> Optional[str]:
+    def walk(x) -> Optional[str]:
         if isinstance(x, dict):
-            for k in ("playingThisWeek", "playing_this_week", "upNext", "tournament", "event", "link", "url", "href", "path", "Slug", "slug"):
-                v = x.get(k)
+            for k, v in x.items():
                 if isinstance(v, str):
-                    m = re.search(r'/dpworld-tour/[^"/]+-20\d{2}/?', v, re.I)
+                    m = SLUG_RX.search(v)
                     if m:
                         return m.group(0).rstrip("/")
-            for v in x.values():
-                got = scan(v)
+                got = walk(v)
                 if got:
                     return got
         elif isinstance(x, list):
             for v in x:
-                got = scan(v)
+                got = walk(v)
                 if got:
                     return got
         elif isinstance(x, str):
-            m = re.search(r'/dpworld-tour/[^"/]+-20\d{2}/?', x, re.I)
+            m = SLUG_RX.search(x)
             if m:
                 return m.group(0).rstrip("/")
         return None
-    return scan(blob)
+    return walk(obj)
 
 def find_playing_this_week_url() -> Optional[str]:
-    pid = PLAYER_ID
-    last_err = None
-    for raw in API_CANDIDATES:
-        url = raw.format(pid=pid)
+    for tpl in API_DISCOVERY:
+        url = tpl.format(pid=PLAYER_ID)
         try:
-            txt = _get(url, as_json=False, allow_jina=True)
-            data = _maybe_json(txt)
-            if data is not None:
-                slug = _find_slug_in_json_blob(data)
-                if slug:
-                    logging.info(f"Playing this week Slug gefunden {slug}")
-                    return BASE + slug
-            m = re.search(r'href="(/dpworld-tour/[^"/]+-20\d{2}/?)"', txt, re.I)
-            if m:
-                slug = m.group(1).rstrip("/")
-                logging.info(f"Playing this week Slug via HTML gefunden {slug}")
-                return BASE + slug
+            data = _get(url, as_json=True)
         except Exception as e:
-            last_err = str(e)
-            logging.debug(f"candidate miss {url} because {e}")
+            logging.debug(f"Discovery miss {url} because {e}")
             continue
-    logging.info(f"Kein Playing this week Slug per API gefunden. Letzter Fehler {last_err}")
+        slug = _scan_for_slug(data)
+        if slug:
+            full = BASE + slug
+            logging.info(f"Playing this week Slug gefunden {slug}")
+            return full
+    logging.info("Kein Playing this week Slug per API gefunden")
     return None
 
 # ------------------------------------------
-# EventId finden
+# EventId nur per API auflösen
 # ------------------------------------------
-EVENT_ID_PATTERNS = [
-    r'"EventId"\s*:\s*(\d+)',
-    r'"eventId"\s*:\s*(\d+)',
-    r'Leaderboard/Strokeplay/(\d+)/'
-]
+def resolve_event_id_via_player_schedule(event_url: str) -> Optional[int]:
+    try:
+        sched = _get(f"https://www.europeantour.com/api/sportdata/Players/{PLAYER_ID}/Schedule?tour=dpworld-tour", as_json=True)
+    except Exception as e:
+        logging.debug(f"Player schedule miss because {e}")
+        return None
+    target = event_url.replace(BASE, "")
+    def match_item(it: Dict[str, Any]) -> bool:
+        for k in ("Url", "URL", "Link", "link", "Path", "path", "EventUrl", "EventURL", "TournamentUrl"):
+            v = it.get(k)
+            if isinstance(v, str) and target in v:
+                return True
+        # manchmal liegt nur der Slug vor
+        for k in ("Slug", "slug"):
+            v = it.get(k)
+            if isinstance(v, str) and v in target:
+                return True
+        return False
+    if isinstance(sched, list):
+        items = sched
+    else:
+        items = sched.get("Items") or sched.get("items") or []
+    for it in items:
+        if not isinstance(it, dict):
+            continue
+        if match_item(it):
+            for k in ("EventId", "eventId", "Id", "id"):
+                if k in it and isinstance(it[k], int):
+                    return int(it[k])
+    return None
 
-def _search_event_id_from_html(html_text: str) -> Optional[int]:
-    for pat in EVENT_ID_PATTERNS:
-        m = re.search(pat, html_text, re.I)
-        if m:
+def resolve_event_id_via_this_week(event_url: str) -> Optional[int]:
+    try:
+        tw = _get("https://www.europeantour.com/api/sportdata/Events/ThisWeek?tour=dpworld-tour", as_json=True)
+    except Exception as e:
+        logging.debug(f"ThisWeek miss because {e}")
+        return None
+    target = event_url.replace(BASE, "")
+    items = []
+    if isinstance(tw, list):
+        items = tw
+    elif isinstance(tw, dict):
+        items = tw.get("Events") or tw.get("events") or []
+    for it in items:
+        if not isinstance(it, dict):
+            continue
+        # vergleiche alle Stringfelder auf den Slug
+        found_url = False
+        for v in it.values():
+            if isinstance(v, str) and target in v:
+                found_url = True
+                break
+        if found_url:
+            for k in ("EventId", "eventId", "Id", "id"):
+                if k in it and isinstance(it[k], int):
+                    return int(it[k])
+    return None
+
+def extract_event_id(event_page_url: str) -> Optional[int]:
+    # 1. Spieler-spezifischer Schedule
+    eid = resolve_event_id_via_player_schedule(event_page_url)
+    if eid:
+        return eid
+    # 2. Events dieser Woche
+    eid = resolve_event_id_via_this_week(event_page_url)
+    if eid:
+        return eid
+    # 3. Als letzte API-Option: Leaderboard-Config JSON, falls vorhanden
+    try:
+        lb_url = urljoin(event_page_url.rstrip("/") + "/", "leaderboard?round=4")
+        # Einige Seiten liefern eingebettetes JSON in <script>__NEXT_DATA__
+        txt = _get(lb_url, as_json=False)
+        for m in re.finditer(r'<script[^>]*>\s*({.*?})\s*</script>', txt, re.S | re.I):
+            block = m.group(1)
+            cleaned = re.sub(r'(?://.*?$)|/\*.*?\*/', '', block, flags=re.M | re.S)
             try:
-                return int(m.group(1))
+                j = json.loads(cleaned)
             except Exception:
                 continue
-    for m in re.finditer(r'<script[^>]*>({.*?})</script>', html_text, re.S | re.I):
-        block = m.group(1)
-        if "EventId" in block or "eventId" in block:
-            try:
-                j = json.loads(block)
-            except Exception:
-                block_clean = re.sub(r'(?://.*?$)|/\*.*?\*/', '', block, flags=re.M | re.S)
-                try:
-                    j = json.loads(block_clean)
-                except Exception:
-                    continue
+            # Tiefensuche nach EventId
             def walk(x):
                 if isinstance(x, dict):
                     for k, v in x.items():
@@ -168,36 +189,20 @@ def _search_event_id_from_html(html_text: str) -> Optional[int]:
                         if got:
                             return got
                 return None
-            found = walk(j)
-            if found:
-                return int(found)
-    return None
-
-def extract_event_id(event_page_url: str) -> Optional[int]:
-    html1 = _get(event_page_url, allow_jina=True)
-    found = _search_event_id_from_html(html1)
-    if found:
-        return found
-    lb_url = urljoin(event_page_url + "/", "leaderboard")
-    html2 = _get(lb_url, allow_jina=True)
-    found = _search_event_id_from_html(html2)
-    if found:
-        return found
-    logging.debug("EventId weder auf Eventseite noch auf Leaderboardseite gefunden")
+            got = walk(j)
+            if got:
+                return int(got)
+    except Exception as e:
+        logging.debug(f"Leaderboard page check miss because {e}")
+    logging.info("EventId wurde per API nicht gefunden")
     return None
 
 # ------------------------------------------
-# API und Fallbacks
+# Sportdata API
 # ------------------------------------------
 def fetch_leaderboard(event_id: int) -> Dict[str, Any]:
     url = f"{BASE}/api/sportdata/Leaderboard/Strokeplay/{event_id}/type/load"
     return _get(url, as_json=True)
-
-def find_player_row(players: List[Dict[str, Any]], pid: int) -> Optional[Dict[str, Any]]:
-    for p in players:
-        if p.get("PlayerId") == pid:
-            return p
-    return None
 
 def try_fetch_scorecard(event_id: int, pid: int) -> Optional[Dict[str, Any]]:
     candidates = [
@@ -214,46 +219,14 @@ def try_fetch_scorecard(event_id: int, pid: int) -> Optional[Dict[str, Any]]:
             logging.debug(f"scorecard miss {url} because {e}")
     return None
 
-def _scrape_fallback_player_row(leaderboard_html: str, player_name: str) -> Optional[Dict[str, Any]]:
-    text = html.unescape(re.sub(r'\s+', ' ', leaderboard_html))
-    m = re.search(r'([T]?\d{1,3})[^<]{0,40}%s[^<]{0,80}?([+\-]?\d{1,2}|E)' % re.escape(player_name), text, re.I)
-    if not m:
-        return None
-    pos = m.group(1)
-    score = m.group(2)
-    return {"PositionDesc": pos, "ScoreToPar": 0 if score.upper() == "E" else int(score)}
-
 # ------------------------------------------
-# Discord und State
+# Utility
 # ------------------------------------------
-def fmt_discord_block(title: str, lines: List[str]) -> str:
-    body = "\n".join(lines)
-    return f"**{title}**\n{body}"
-
-def post_discord(content: str):
-    if not DISCORD_WEBHOOK:
-        logging.warning("DISCORD_WEBHOOK_LIVE fehlt. Ausgabe nur im Log.")
-        logging.info(content)
-        return
-    try:
-        r = SESSION.post(DISCORD_WEBHOOK, json={"content": content}, timeout=20)
-        if r.status_code >= 300:
-            logging.error(f"Discord Webhook Fehler {r.status_code} {r.text[:200]}")
-    except Exception as e:
-        logging.error(f"Discord Webhook Exception {e}")
-
-def state_path(event_id: int) -> pathlib.Path:
-    return STATE_DIR / f"{event_id}_state.json"
-
-def load_state(event_id: int) -> Dict[str, Any]:
-    p = state_path(event_id)
-    if p.exists():
-        return json.loads(p.read_text(encoding="utf-8"))
-    return {"posted_rounds": [], "posted_all_finished": False}
-
-def save_state(event_id: int, data: Dict[str, Any]):
-    p = state_path(event_id)
-    p.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+def find_player_row(players: List[Dict[str, Any]], pid: int) -> Optional[Dict[str, Any]]:
+    for p in players:
+        if p.get("PlayerId") == pid:
+            return p
+    return None
 
 def round_completed_for(player: Dict[str, Any], rno: int) -> Optional[int]:
     rounds = player.get("Rounds", []) or []
@@ -307,35 +280,57 @@ def build_par_and_strokes_text(scorecard: Optional[Dict[str, Any]], rno: int) ->
     lines.append("Scorecard strukturiert, aber Feldnamen unbekannt. Debug aktivieren.")
     return lines
 
+def fmt_discord_block(title: str, lines: List[str]) -> str:
+    body = "\n".join(lines)
+    return f"**{title}**\n{body}"
+
+def post_discord(content: str):
+    if not DISCORD_WEBHOOK:
+        logging.warning("DISCORD_WEBHOOK_LIVE fehlt. Ausgabe nur im Log.")
+        logging.info(content)
+        return
+    try:
+        r = SESSION.post(DISCORD_WEBHOOK, json={"content": content}, timeout=20)
+        if r.status_code >= 300:
+            logging.error(f"Discord Webhook Fehler {r.status_code} {r.text[:200]}")
+    except Exception as e:
+        logging.error(f"Discord Webhook Exception {e}")
+
+def state_path(event_id: int) -> pathlib.Path:
+    return STATE_DIR / f"{event_id}_state.json"
+
+def load_state(event_id: int) -> Dict[str, Any]:
+    p = state_path(event_id)
+    if p.exists():
+        return json.loads(p.read_text(encoding="utf-8"))
+    return {"posted_rounds": [], "posted_all_finished": False}
+
+def save_state(event_id: int, data: Dict[str, Any]):
+    p = state_path(event_id)
+    p.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+
 # ------------------------------------------
 # Hauptlogik
 # ------------------------------------------
 def main():
+    # 1. Spielerprofil per API auflösen
     event_url = find_playing_this_week_url()
     if not event_url:
         logging.info("Kein Turnier unter Playing this week gefunden. Abbruch.")
         return
 
+    # 2. Leaderboard-Seite aus Slug ableiten für round=4
+    leaderboard_page = urljoin(event_url.rstrip('/') + '/', "leaderboard?round=4")
+    logging.info(f"Leaderboard Seite {leaderboard_page}")
+
+    # 3. EventId strikt per API herleiten
     event_id = extract_event_id(event_url)
     if not event_id:
-        logging.info("EventId wurde nicht gefunden. Versuche HTML Fallback.")
-        leaderboard_html = _get(f"{event_url}/leaderboard", allow_jina=True)
-        scraped = _scrape_fallback_player_row(leaderboard_html, "Marcel Schneider")
-        if scraped:
-            lines = [
-                "Turnier",
-                f"{event_url}",
-                "Schnappschuss ohne API",
-                f"Aktueller Rang {scraped['PositionDesc']}",
-                f"Gesamt gegen Par {scraped['ScoreToPar']}",
-                "Leaderboard Link",
-                f"{event_url}/leaderboard"
-            ]
-            post_discord(fmt_discord_block("Marcel Schneider Update", lines))
-        else:
-            logging.info("Weder API noch HTML Fallback lieferte Daten für Marcel Schneider.")
+        logging.info("EventId wurde nicht gefunden. Abbruch.")
         return
+    logging.info(f"EventId {event_id}")
 
+    # 4. Leaderboard laden
     lb = fetch_leaderboard(event_id)
     players = lb.get("Players") or []
     me = find_player_row(players, PLAYER_ID)
@@ -343,9 +338,11 @@ def main():
         logging.info("Marcel Schneider ist nicht im Leaderboard vorhanden.")
         return
 
+    # 5. State laden
     state = load_state(event_id)
     did_post = False
 
+    # 6. Rundenabschlüsse posten
     for rno in [1, 2, 3, 4]:
         if rno in state["posted_rounds"]:
             continue
@@ -362,16 +359,15 @@ def main():
             f"Aktueller Rang {pos_desc}",
             f"Score gesamt gegen Par {score_to_par}",
             "Leaderboard Link",
-            f"{event_url}/leaderboard?round=4"
+            f"{leaderboard_page}"
         ]
         scorecard = try_fetch_scorecard(event_id, PLAYER_ID)
         round_lines.extend(build_par_and_strokes_text(scorecard, rno))
-
-        content = fmt_discord_block("Marcel Schneider Update", round_lines)
-        post_discord(content)
+        post_discord(fmt_discord_block("Marcel Schneider Update", round_lines))
         state["posted_rounds"].append(rno)
         did_post = True
 
+    # 7. Tagesabschluss posten, wenn alle Spieler fertig sind
     if not state.get("posted_all_finished"):
         for rno in [1, 2, 3, 4]:
             if all_players_finished_round(players, rno):
@@ -381,13 +377,14 @@ def main():
                     "Tagesplatzierung von Marcel Schneider",
                     f"{pos_desc}",
                     "Leaderboard",
-                    f"{event_url}/leaderboard?round=4"
+                    f"{leaderboard_page}"
                 ]
                 post_discord(fmt_discord_block("Tagesabschluss", lines))
                 state["posted_all_finished"] = True
                 did_post = True
                 break
 
+    # 8. State speichern
     if did_post:
         save_state(event_id, state)
     else:
