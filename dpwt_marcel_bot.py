@@ -15,7 +15,7 @@ STATE_DIR.mkdir(parents=True, exist_ok=True)
 
 DISCORD_WEBHOOK = os.environ.get("DISCORD_WEBHOOK_LIVE", "").strip()
 DEBUG = os.environ.get("DEBUG", "0") == "1"
-TZ = dt.timezone(dt.timedelta(hours=2))  # grob Europe/Berlin
+TZ = dt.timezone(dt.timedelta(hours=2))
 
 logging.basicConfig(
     level=logging.DEBUG if DEBUG else logging.INFO,
@@ -24,7 +24,7 @@ logging.basicConfig(
 
 SESSION = requests.Session()
 SESSION.headers.update({
-    "User-Agent": "dpwt-marcel-bot/1.4 (+github-actions)",
+    "User-Agent": "dpwt-marcel-bot/1.5 (+github-actions)",
     "Accept": "text/html,application/json"
 })
 
@@ -63,7 +63,6 @@ def find_playing_this_week_url() -> Optional[str]:
     hay = block.group(1) if block else html_text
     m = re.search(r'href="(/dpworld-tour/[^"/]+-20\d{2}/?)"', hay, re.I)
     if not m:
-        # Fallback innerhalb der gleichen Seite, falls DOM etwas anders ist
         m = re.search(r'(/dpworld-tour/[^"/]+-20\d{2}/?)', hay, re.I)
     if not m:
         return None
@@ -74,67 +73,89 @@ def find_playing_this_week_url() -> Optional[str]:
 
 # ------------------------------------------
 # Schritt 3 und 4
-# Leaderboard-Seite zusammensetzen und EventId ermitteln
+# Leaderboard-Seite aufbauen
 # ------------------------------------------
-EVENT_ID_PATTERNS = [
-    r'"EventId"\s*:\s*(\d+)',
-    r'"eventId"\s*:\s*(\d+)',
-    r'/api/sportdata/Leaderboard/Strokeplay/(\d+)/type/load',
-    r'Leaderboard/Strokeplay/(\d+)/'
-]
+def build_leaderboard_page(event_page_url: str) -> str:
+    return urljoin(event_page_url.rstrip("/") + "/", "leaderboard?round=4")
 
-def _search_event_id_from_html(html_text: str) -> Optional[int]:
-    # Direkte Patterns
-    for pat in EVENT_ID_PATTERNS:
-        m = re.search(pat, html_text, re.I)
-        if m:
-            try:
-                return int(m.group(1))
-            except Exception:
-                continue
-    # JSON-Blöcke aus <script> herauslösen
+# ------------------------------------------
+# Schritt 4 fortgesetzt
+# EventId ausschließlich von der Leaderboard-Seite extrahieren
+# ------------------------------------------
+EVENT_LOAD_URL_RX = re.compile(
+    r'/api/sportdata/Leaderboard/Strokeplay/(\d+)/type/load',
+    re.I
+)
+EVENT_ID_KEYPATH_RX = re.compile(
+    r'"(?:EventId|eventId)"\s*:\s*(\d+)',
+    re.I
+)
+
+def _event_id_from_text(html_text: str) -> Optional[int]:
+    m = EVENT_LOAD_URL_RX.search(html_text)
+    if m:
+        try:
+            return int(m.group(1))
+        except Exception:
+            pass
     for m in re.finditer(r'<script[^>]*>\s*({.*?})\s*</script>', html_text, re.S | re.I):
         block = m.group(1)
-        if "EventId" in block or "eventId" in block:
+        try:
+            j = json.loads(block)
+        except Exception:
+            cleaned = re.sub(r'(?://.*?$)|/\*.*?\*/', '', block, flags=re.M | re.S)
             try:
-                j = json.loads(block)
+                j = json.loads(cleaned)
             except Exception:
-                cleaned = re.sub(r'(?://.*?$)|/\*.*?\*/', '', block, flags=re.M | re.S)
-                try:
-                    j = json.loads(cleaned)
-                except Exception:
-                    continue
-            def walk(x):
-                if isinstance(x, dict):
-                    for k, v in x.items():
-                        if k in ("EventId", "eventId") and isinstance(v, int):
-                            return v
-                        got = walk(v)
-                        if got:
-                            return got
-                elif isinstance(x, list):
-                    for v in x:
-                        got = walk(v)
-                        if got:
-                            return got
-                return None
-            got = walk(j)
-            if got:
-                return int(got)
+                continue
+        def walk(x):
+            if isinstance(x, dict):
+                for k, v in x.items():
+                    if k in ("EventId", "eventId") and isinstance(v, int):
+                        return v
+                    got = walk(v)
+                    if got:
+                        return got
+            elif isinstance(x, list):
+                for v in x:
+                    got = walk(v)
+                    if got:
+                        return got
+            return None
+        got = walk(j)
+        if got:
+            return int(got)
+    m = EVENT_ID_KEYPATH_RX.search(html_text)
+    if m:
+        try:
+            return int(m.group(1))
+        except Exception:
+            pass
     return None
 
 def extract_event_id(event_page_url: str) -> Optional[int]:
-    # Eventseite prüfen
-    html1 = _get(event_page_url, allow_jina=True)
-    found = _search_event_id_from_html(html1)
-    if found:
-        return found
-    # Leaderboard-Seite mit round gleich vier prüfen
-    lb_url = urljoin(event_page_url.rstrip("/") + "/", "leaderboard?round=4")
-    html2 = _get(lb_url, allow_jina=True)
-    found = _search_event_id_from_html(html2)
-    if found:
-        return found
+    lb_url = build_leaderboard_page(event_page_url)
+
+    # Versuch 1 über Jina-HTML der Leaderboard-Seite
+    try:
+        html1 = _get(lb_url, allow_jina=True)
+        eid = _event_id_from_text(html1)
+        if eid:
+            logging.info(f"EventId Quelle Leaderboard Jina {eid}")
+            return eid
+    except Exception as e:
+        logging.debug(f"LeaderBoard Jina miss because {e}")
+
+    # Versuch 2 direkt ohne Proxy
+    try:
+        html2 = _get(lb_url, allow_jina=False)
+        eid = _event_id_from_text(html2)
+        if eid:
+            logging.info(f"EventId Quelle Leaderboard direkt {eid}")
+            return eid
+    except Exception as e:
+        logging.debug(f"LeaderBoard direct miss because {e}")
+
     logging.info("EventId wurde nicht gefunden")
     return None
 
@@ -255,24 +276,20 @@ def save_state(event_id: int, data: Dict[str, Any]):
 # Hauptlogik
 # ------------------------------------------
 def main():
-    # Schritt 1 und 2
     event_url = find_playing_this_week_url()
     if not event_url:
         logging.info("Kein Turnier unter Playing this week gefunden. Abbruch.")
         return
 
-    # Schritt 3 und 4
-    leaderboard_page = urljoin(event_url.rstrip('/') + '/', "leaderboard?round=4")
+    leaderboard_page = build_leaderboard_page(event_url)
     logging.info(f"Leaderboard Seite {leaderboard_page}")
 
-    # Schritt 4 EventId ermitteln
     event_id = extract_event_id(event_url)
     if not event_id:
         logging.info("EventId wurde nicht gefunden. Abbruch.")
         return
     logging.info(f"EventId {event_id}")
 
-    # Schritt 5 Daten ziehen
     lb = fetch_leaderboard(event_id)
     players = lb.get("Players") or []
     me = find_player_row(players, PLAYER_ID)
