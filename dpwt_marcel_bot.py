@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
-import os, re, json, time, hashlib, logging, pathlib, datetime as dt
+import os, re, json, time, hashlib, logging, pathlib, datetime as dt, html
 from typing import Optional, Dict, Any, List
+from urllib.parse import urljoin
 import requests
 
 PLAYER_ID = 35703  # Marcel Schneider
@@ -11,7 +12,7 @@ STATE_DIR.mkdir(parents=True, exist_ok=True)
 
 DISCORD_WEBHOOK = os.environ.get("DISCORD_WEBHOOK_LIVE", "").strip()
 DEBUG = os.environ.get("DEBUG", "0") == "1"
-TZ = dt.timezone(dt.timedelta(hours=2))  # Europe/Berlin in Saison ohne genaue DST Logik
+TZ = dt.timezone(dt.timedelta(hours=2))  # Europe/Berlin in Saison ohne DST
 
 logging.basicConfig(
     level=logging.DEBUG if DEBUG else logging.INFO,
@@ -20,14 +21,17 @@ logging.basicConfig(
 
 SESSION = requests.Session()
 SESSION.headers.update({
-    "User-Agent": "dpwt-marcel-bot/1.0 (+github-actions)",
+    "User-Agent": "dpwt-marcel-bot/1.1 (+github-actions)",
     "Accept": "text/html,application/json"
 })
+
+# ------------------------------------------
+# Hilfsfunktionen
+# ------------------------------------------
 
 def _get(url: str, as_json=False, allow_jina=False) -> Any:
     try_urls = [url]
     if allow_jina:
-        # Jina Proxy umgeht Bot-Schutz und liefert statisches HTML
         if url.startswith("https://"):
             try_urls.insert(0, JINA + url[len("https://"):])
         elif url.startswith("http://"):
@@ -47,39 +51,86 @@ def _get(url: str, as_json=False, allow_jina=False) -> Any:
     raise RuntimeError(f"fetch failed for {url} because {last_err}")
 
 def find_playing_this_week_url() -> Optional[str]:
-    # Profilseite lesen und den Link im Block Playing this week finden
     profile = f"{BASE}/players/marcel-schneider-{PLAYER_ID}/?tour=dpworld-tour"
-    html = _get(profile, allow_jina=True)
-    # Suche auf a-Href mit Turnier-Slug innerhalb von 'playing this week'
-    # Robust per Regex gegen unterschiedliche DOM-Strukturen
-    block = re.search(r"Playing this week(.+?)</section", html, re.I | re.S)
-    hay = block.group(1) if block else html
+    html_text = _get(profile, allow_jina=True)
+    block = re.search(r"Playing this week(.+?)</section", html_text, re.I | re.S)
+    hay = block.group(1) if block else html_text
     m = re.search(r'href="(/dpworld-tour/[^"/]+-20\d{2}/?)"', hay, re.I)
     if not m:
-        # Fallback über Startseite Turnierfeed
         front = _get(f"{BASE}/dpworld-tour/", allow_jina=True)
         m = re.search(r'href="(/dpworld-tour/[^"/]+-20\d{2}/?)".{0,200}?Tournament feed', front, re.I | re.S)
     if not m:
         return None
     return BASE + m.group(1).rstrip("/")
 
-def extract_event_id(event_page_url: str) -> Optional[int]:
-    html = _get(event_page_url, allow_jina=True)
-    # EventId steckt in eingebettetem JSON
-    m = re.search(r'EventId"\s*:\s*(\d+)', html)
-    if m:
-        return int(m.group(1))
-    # Zweiter Versuch über Leaderboard-Seite
-    lb = _get(f"{event_page_url}/leaderboard?round=4", allow_jina=True)
-    m = re.search(r'EventId"\s*:\s*(\d+)', lb)
-    if m:
-        return int(m.group(1))
+# ------------------------------------------
+# EventId-Erkennung und Fallback
+# ------------------------------------------
+
+EVENT_ID_PATTERNS = [
+    r'"EventId"\s*:\s*(\d+)',
+    r'"eventId"\s*:\s*(\d+)',
+    r'Leaderboard/Strokeplay/(\d+)/'
+]
+
+def _search_event_id_from_html(html_text: str) -> Optional[int]:
+    for pat in EVENT_ID_PATTERNS:
+        m = re.search(pat, html_text, re.I)
+        if m:
+            try:
+                return int(m.group(1))
+            except Exception:
+                continue
+    for m in re.finditer(r'<script[^>]*>({.*?})</script>', html_text, re.S | re.I):
+        block = m.group(1)
+        if "EventId" in block or "eventId" in block:
+            try:
+                j = json.loads(block)
+            except Exception:
+                block_clean = re.sub(r'(?://.*?$)|/\*.*?\*/', '', block, flags=re.M | re.S)
+                try:
+                    j = json.loads(block_clean)
+                except Exception:
+                    continue
+            def walk(x):
+                if isinstance(x, dict):
+                    for k, v in x.items():
+                        if k in ("EventId", "eventId") and isinstance(v, int):
+                            return v
+                        got = walk(v)
+                        if got:
+                            return got
+                elif isinstance(x, list):
+                    for v in x:
+                        got = walk(v)
+                        if got:
+                            return got
+                return None
+            found = walk(j)
+            if found:
+                return int(found)
     return None
+
+def extract_event_id(event_page_url: str) -> Optional[int]:
+    html1 = _get(event_page_url, allow_jina=True)
+    found = _search_event_id_from_html(html1)
+    if found:
+        return found
+    lb_url = urljoin(event_page_url + "/", "leaderboard")
+    html2 = _get(lb_url, allow_jina=True)
+    found = _search_event_id_from_html(html2)
+    if found:
+        return found
+    logging.debug("EventId weder auf Eventseite noch auf Leaderboardseite gefunden")
+    return None
+
+# ------------------------------------------
+# API und Fallbacks
+# ------------------------------------------
 
 def fetch_leaderboard(event_id: int) -> Dict[str, Any]:
     url = f"{BASE}/api/sportdata/Leaderboard/Strokeplay/{event_id}/type/load"
-    data = _get(url, as_json=True)
-    return data
+    return _get(url, as_json=True)
 
 def find_player_row(players: List[Dict[str, Any]], pid: int) -> Optional[Dict[str, Any]]:
     for p in players:
@@ -88,7 +139,6 @@ def find_player_row(players: List[Dict[str, Any]], pid: int) -> Optional[Dict[st
     return None
 
 def try_fetch_scorecard(event_id: int, pid: int) -> Optional[Dict[str, Any]]:
-    # Nicht dokumentiert. Daher mehrere Patterns versuchen.
     candidates = [
         f"{BASE}/api/sportdata/Scorecard/Strokeplay/{event_id}/Player/{pid}",
         f"{BASE}/api/sportdata/Leaderboard/Strokeplay/{event_id}/Player/{pid}",
@@ -102,6 +152,19 @@ def try_fetch_scorecard(event_id: int, pid: int) -> Optional[Dict[str, Any]]:
         except Exception as e:
             logging.debug(f"scorecard miss {url} because {e}")
     return None
+
+def _scrape_fallback_player_row(leaderboard_html: str, player_name: str) -> Optional[Dict[str, Any]]:
+    text = html.unescape(re.sub(r'\s+', ' ', leaderboard_html))
+    m = re.search(r'([T]?\d{1,3})[^<]{0,40}%s[^<]{0,80}?([+\-]?\d{1,2}|E)' % re.escape(player_name), text, re.I)
+    if not m:
+        return None
+    pos = m.group(1)
+    score = m.group(2)
+    return {"PositionDesc": pos, "ScoreToPar": 0 if score.upper() == "E" else int(score)}
+
+# ------------------------------------------
+# Discord / State
+# ------------------------------------------
 
 def fmt_discord_block(title: str, lines: List[str]) -> str:
     body = "\n".join(lines)
@@ -133,7 +196,6 @@ def save_state(event_id: int, data: Dict[str, Any]):
     p.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 
 def round_completed_for(player: Dict[str, Any], rno: int) -> Optional[int]:
-    # Gibt Strokes zurück, wenn Runde abgeschlossen
     rounds = player.get("Rounds", []) or []
     for r in rounds:
         if r.get("RoundNo") == rno and r.get("Strokes") is not None:
@@ -156,11 +218,8 @@ def build_par_and_strokes_text(scorecard: Optional[Dict[str, Any]], rno: int) ->
     if not scorecard:
         lines.append("Scorecard nicht verfügbar. Ich liefere Runden-Gesamtwert.")
         return lines
-    # Erwartete Struktur erraten und defensiv lesen
-    # Beispiele aus DPWT variieren je nach Event
     rkey = str(rno)
     holes = scorecard.get("Holes") or scorecard.get("holes") or []
-    # Fallback auf strukturierte Runden
     per_round = scorecard.get("Rounds") or scorecard.get("rounds") or {}
     data = per_round.get(rkey) if isinstance(per_round, dict) else None
     if data and isinstance(data, dict):
@@ -172,7 +231,6 @@ def build_par_and_strokes_text(scorecard: Optional[Dict[str, Any]], rno: int) ->
             lines.append("Schläge pro Loch")
             lines.append(" ".join(str(x) for x in strokes))
             return lines
-    # Wenn nur flache Liste der Löcher vorhanden ist
     if holes and isinstance(holes, list) and isinstance(holes[0], dict):
         pars = []
         strokes = []
@@ -189,6 +247,10 @@ def build_par_and_strokes_text(scorecard: Optional[Dict[str, Any]], rno: int) ->
     lines.append("Scorecard strukturiert, aber Feldnamen unbekannt. Debug aktivieren.")
     return lines
 
+# ------------------------------------------
+# Hauptlogik
+# ------------------------------------------
+
 def main():
     event_url = find_playing_this_week_url()
     if not event_url:
@@ -196,7 +258,22 @@ def main():
         return
     event_id = extract_event_id(event_url)
     if not event_id:
-        logging.info("EventId wurde nicht gefunden. Abbruch.")
+        logging.info("EventId wurde nicht gefunden. Versuche HTML-Fallback.")
+        leaderboard_html = _get(f"{event_url}/leaderboard", allow_jina=True)
+        scraped = _scrape_fallback_player_row(leaderboard_html, "Marcel Schneider")
+        if scraped:
+            lines = [
+                "Turnier",
+                f"{event_url}",
+                "Schnappschuss ohne API",
+                f"Aktueller Rang {scraped['PositionDesc']}",
+                f"Gesamt gegen Par {scraped['ScoreToPar']}",
+                "Leaderboard Link",
+                f"{event_url}/leaderboard"
+            ]
+            post_discord(fmt_discord_block("Marcel Schneider Update", lines))
+        else:
+            logging.info("Weder API noch HTML-Fallback lieferten Daten für Marcel Schneider.")
         return
 
     lb = fetch_leaderboard(event_id)
@@ -207,16 +284,14 @@ def main():
         return
 
     state = load_state(event_id)
-
-    # Für jede Runde prüfen und ggf. posten
     did_post = False
+
     for rno in [1, 2, 3, 4]:
         if rno in state["posted_rounds"]:
             continue
         strokes = round_completed_for(me, rno)
         if strokes is None:
-            continue  # Runde läuft oder noch nicht gestartet
-        # Werte sammeln
+            continue
         pos_desc = me.get("PositionDesc")
         score_to_par = me.get("ScoreToPar")
         round_lines = [
@@ -229,7 +304,6 @@ def main():
             f"Leaderboard Link",
             f"{event_url}/leaderboard?round=4"
         ]
-        # Hole-by-Hole ergänzen, sofern Scorecard gefunden wird
         scorecard = try_fetch_scorecard(event_id, PLAYER_ID)
         round_lines.extend(build_par_and_strokes_text(scorecard, rno))
 
@@ -238,11 +312,9 @@ def main():
         state["posted_rounds"].append(rno)
         did_post = True
 
-    # Gesamtinfo posten, wenn alle Spieler alle Löcher einer Runde beendet haben
     if not state.get("posted_all_finished"):
         for rno in [1, 2, 3, 4]:
             if all_players_finished_round(players, rno):
-                # Tagesplatzierung posten
                 pos_desc = me.get("PositionDesc")
                 lines = [
                     f"Alle Spieler haben Runde {rno} abgeschlossen",
