@@ -1,0 +1,54 @@
+name: DPWT Marcel Bot
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+      - master
+  schedule:
+    # Alle zwei Stunden prüfen
+    - cron: "0 */2 * * *"
+
+jobs:
+  run-bot:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write   # für Zustandsdateien im Cache
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Python einrichten
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Abhängigkeiten installieren
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests
+
+      - name: Cache für Zustandsdateien laden
+        uses: actions/cache@v4
+        with:
+          path: .state
+          key: dpwt-state-${{ github.run_id }}
+          restore-keys: |
+            dpwt-state-
+
+      - name: Bot ausführen
+        env:
+          DISCORD_WEBHOOK_LIVE: ${{ secrets.DISCORD_WEBHOOK_LIVE }}
+          DEBUG: ${{ vars.DEBUG || '0' }}
+        run: |
+          python dpwt_marcel_bot.py
+
+      - name: Cache aktualisieren
+        if: always()
+        uses: actions/cache@v4
+        with:
+          path: .state
+          key: dpwt-state-${{ github.run_id }}
+          restore-keys: |
+            dpwt-state-
