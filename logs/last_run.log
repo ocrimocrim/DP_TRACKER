@@ -1,0 +1,5 @@
+2025-10-17 00:01:29,228 [INFO] === DPWT Leaderboard Watcher gestartet ===
+2025-10-17 00:01:29,228 [ERROR] Kein DISCORD_WEBHOOK_2 gefunden – bitte im GitHub Secret setzen.
+2025-10-17 00:01:29,228 [INFO] Hole Upcoming-Event (PLAYER_UPCOMING JSON)...
+2025-10-17 00:01:31,801 [INFO] Starte Playwright-Browser für URL: https://www.europeantour.com/players/marcel-schneider-35703/?tour=dpworld-tour
+2025-10-17 00:01:37,069 [WARNING] Keine Upcoming-Daten erhalten.
