@@ -26,7 +26,7 @@ STATE_FILE = STATE_DIR / "state_dpwt.json"
 LAST_RUN_LOG = LOG_DIR / "last_run.log"
 
 # Discord
-DISCORD_WEBHOOK = os.getenv("DISCORD_WEBHOOK_2", "").strip()
+DISCORD_WEBHOOK = os.getenv("DISCORD_WEBHOOK_LIVE", "").strip()
 
 # --------------------
 # Logging
@@ -245,7 +245,7 @@ def main():
 
     state = load_state()
     if not DISCORD_WEBHOOK:
-        logging.error("Kein DISCORD_WEBHOOK_2 gefunden – bitte im GitHub Secret setzen.")
+        logging.error("Kein DDISCORD_WEBHOOK_LIVE gefunden – bitte im GitHub Secret setzen.")
 
     # 1) Upcoming-Ereignis laden (JSON via Browser fetch)
     upcoming = get_player_upcoming()
