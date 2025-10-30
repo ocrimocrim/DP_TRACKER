@@ -6,13 +6,16 @@ import requests
 API_URL = os.getenv("API_URL", "https://www.europeantour.com/api/v1/players/35703/results/2025/")
 DISCORD_WEBHOOK = os.getenv("DISCORD_WEBHOOK")
 
+# Arbeitsverzeichnis des Skripts für persistente Dateien ermitteln.
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+
 # GitHub Settings für optionalen State und Archiv über Contents API
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
 GH_REPO = os.getenv("GH_REPO")  # owner/repo
 env_val = os.getenv("STATE_ISSUE_NUMBER", "").strip()
 STATE_ISSUE_NUMBER = int(env_val) if env_val.isdigit() else 0
 
-STATE_FILE = ".state.json"
+STATE_FILE = os.path.join(SCRIPT_DIR, ".state.json")
 
 USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127 Safari/537.36",
